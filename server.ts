@@ -173,8 +173,48 @@ async function startServer() {
     res.json({ success: true, message: `Chunk ${chunkIndex}/${totalChunks} saved` });
   });
 
+  // Detecção de estabilidade real do arquivo no disco
+  const waitForStableFile = (filePath: string): Promise<void> => {
+    return new Promise((resolve) => {
+      let lastSize = -1;
+      let stableCount = 0;
+
+      const check = () => {
+        try {
+          if (!fs.existsSync(filePath)) {
+            setTimeout(check, 300);
+            return;
+          }
+          const stats = fs.statSync(filePath);
+          const size = stats.size;
+
+          if (size > 0 && size === lastSize) {
+            stableCount++;
+          } else {
+            stableCount = 0;
+            lastSize = size;
+          }
+
+          // arquivo considerado finalizado após estabilidade contínua (3 verificações de 300ms)
+          if (stableCount >= 3) {
+            return resolve();
+          }
+
+          setTimeout(check, 300);
+        } catch {
+          setTimeout(check, 300);
+        }
+      };
+
+      check();
+    });
+  };
+
   // Helper para extração ZIP segura e assíncrona
   const extractZipSafe = async (filePath: string, outputPath: string, logLabel: string) => {
+    console.log(`[ZIP] ${logLabel}: Aguardando estabilidade do arquivo...`);
+    await waitForStableFile(filePath);
+
     if (!fs.existsSync(filePath)) {
       throw new Error(`Arquivo ZIP não encontrado: ${filePath}`);
     }
@@ -185,7 +225,7 @@ async function startServer() {
       throw new Error(`Arquivo ZIP corrompido ou vazio (0 bytes).`);
     }
 
-    console.log(`[ZIP] ${logLabel}: Iniciando extração de ${filePath} (${stats.size} bytes)`);
+    console.log(`[ZIP] ${logLabel}: Arquivo estável confirmado (${stats.size} bytes). Iniciando extração...`);
     io.emit("console_log", `[MineControl] ${logLabel}: Extraindo arquivos (${(stats.size/1024/1024).toFixed(2)} MB)...`);
     
     try {
