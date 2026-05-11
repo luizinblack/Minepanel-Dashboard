@@ -136,7 +136,7 @@ export default function App() {
   const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [activeUploads, setActiveUploads] = useState<any[]>([]);
-  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace' | 'saas'>('monitor');
   const [currentPath, setCurrentPath] = useState<string>(".");
   const [fileList, setFileList] = useState<any[]>([]);
   const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
@@ -814,10 +814,19 @@ export default function App() {
               Console do Servidor
             </button>
             <button 
-              onClick={() => setActiveTab('saas' as any)}
+              onClick={() => setActiveTab('marketplace')}
               className={cn(
                 "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
-                activeTab === ('saas' as any) ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+                activeTab === 'marketplace' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+              )}
+            >
+              <Archive size={12} /> Marketplace
+            </button>
+            <button 
+              onClick={() => setActiveTab('saas')}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
+                activeTab === 'saas' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
               )}
             >
               <Layout size={12} /> SaaS Portal
@@ -1109,7 +1118,7 @@ export default function App() {
                     </div>
                   </div>
               </motion.div>
-            ) : activeTab === ('saas' as any) ? (
+            ) : activeTab === 'saas' ? (
               <motion.div 
                 key="saas"
                 initial={{ opacity: 0, scale: 0.95 }}
