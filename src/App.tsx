@@ -208,24 +208,6 @@ export default function App() {
       console.warn("API status fetch failed (expected if server hasn't restarted yet)");
     }
 
-    const fetchSaaSData = async () => {
-      try {
-        const res = await fetch('/api/saas/me', {
-           headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setSaaSData(data);
-          setIsLogged(true);
-        }
-      } catch (e) {
-        console.error("Error fetching SaaS data:", e);
-      }
-    };
-
-    fetchSaaSData();
-    const saasInterval = setInterval(fetchSaaSData, 10000);
-
     socket.on('system_metrics', (newMetrics: SystemStats) => {
       setStats(newMetrics);
       setStatsHistory(prev => {
@@ -312,24 +294,58 @@ export default function App() {
 
     fetchInitialData();
 
-    // Check Sync Status periodically
-    const syncInterval = setInterval(async () => {
-      try {
-        const res = await fetch('/api/marketplace/sync/status');
-        if (res.ok) setSyncStatus(await res.json());
-      } catch (e) {}
-    }, 10000);
-
     return () => {
       socket.off('system_metrics');
       socket.off('status_change');
       socket.off('console_log');
       socket.off('job_update');
       socket.off('refresh_data');
-      clearInterval(syncInterval);
-      clearInterval(saasInterval);
     };
   }, []);
+
+  // SaaS Data Polling - Paused during upload
+  useEffect(() => {
+    if (activeTab === 'saas' && localStorage.getItem('minecontrol_token') && !isUploading) {
+      const fetchSaaS = async () => {
+        try {
+          const res = await fetch('/api/saas/me', {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
+          });
+          if (res.ok) {
+            const data = await res.json();
+            setSaaSData(data);
+            setIsLogged(true);
+          }
+        } catch (e) {
+          console.error("Erro ao buscar dados SaaS", e);
+        }
+      };
+
+      fetchSaaS();
+      const interval = setInterval(fetchSaaS, 30000); // Optimized for high load
+      return () => clearInterval(interval);
+    }
+  }, [activeTab, isUploading]);
+
+  // Marketplace Sync Polling - Paused during upload
+  useEffect(() => {
+    let interval: any;
+    if (activeTab === 'marketplace' && !isUploading) {
+      const checkSync = async () => {
+        try {
+          const res = await fetch('/api/marketplace/sync/status');
+          if (res.ok) {
+            const data = await res.json();
+            setSyncStatus(data);
+          }
+        } catch (e) {}
+      };
+
+      checkSync();
+      interval = setInterval(checkSync, 10000);
+    }
+    return () => clearInterval(interval);
+  }, [activeTab, isUploading]);
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -359,84 +375,89 @@ export default function App() {
   };
 
   const uploadChunked = async (file: File, options: any = {}) => {
-    const { 
-      onProgress = () => {}, 
-      fileId = `${file.name}-${file.size}-${file.lastModified}`,
-      CHUNK_SIZE = 5 * 1024 * 1024, // 5MB per chunk (optimized for large sets)
-      sharedLimit = globalUploadLimit
-    } = options;
+    setIsUploading(true);
+    try {
+      const { 
+        onProgress = () => {}, 
+        fileId = `${file.name}-${file.size}-${file.lastModified}`,
+        CHUNK_SIZE = 5 * 1024 * 1024, // 5MB per chunk (optimized for large sets)
+        sharedLimit = globalUploadLimit
+      } = options;
 
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const headers: any = { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` };
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const headers: any = { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` };
 
-    // 1. Check status (Resume support)
-    const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`, { headers });
-    if (!statusRes.ok) {
-       const errData = await statusRes.json().catch(() => ({}));
-       throw new Error(errData.error || `Failed to check upload status: ${statusRes.status}`);
-    }
-    const { uploadedChunks } = await statusRes.json();
-    
-    const remainingChunks = [];
-    for (let i = 0; i < totalChunks; i++) {
-       if (!uploadedChunks.includes(i)) remainingChunks.push(i);
-    }
-
-    if (remainingChunks.length === 0) {
-       onProgress(100);
-       return;
-    }
-
-    // 2. Upload queue with global concurrency control and retry logic
-    let finishedChunks = totalChunks - remainingChunks.length;
-    
-    const tasks = remainingChunks.map(index => sharedLimit(async () => {
-      let attempts = 0;
-      const maxAttempts = 3;
-
-      while (attempts < maxAttempts) {
-        try {
-          const start = index * CHUNK_SIZE;
-          const end = Math.min(file.size, start + CHUNK_SIZE);
-          const chunk = file.slice(start, end);
-
-          const formData = new FormData();
-          formData.append('chunk', chunk);
-          formData.append('fileId', fileId);
-          formData.append('index', index.toString());
-          formData.append('total', totalChunks.toString());
-          formData.append('fileName', file.name);
-          formData.append('mimeType', file.type);
-
-          const res = await fetch('/api/admin/upload/chunk', {
-            method: 'POST',
-            headers,
-            body: formData,
-          });
-
-          if (!res.ok) {
-            const errData = await res.json().catch(() => ({}));
-            // Don't retry if it's a quota issue
-            if (res.status === 403) throw new Error(errData.error || "Limite atingido (Quota exceeded)");
-            if (res.status === 429) throw new Error("Muitas requisições (Rate Limit)");
-            throw new Error(errData.error || `Upload failed: ${res.status}`);
-          }
-          
-          finishedChunks++;
-          onProgress(Math.round((finishedChunks / totalChunks) * 100));
-          return; // Success
-        } catch (err: any) {
-          attempts++;
-          if (attempts >= maxAttempts || err.message.includes("Limite atingido")) {
-            throw err;
-          }
-          // Exponential backoff
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempts)));
-        }
+      // 1. Check status (Resume support)
+      const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`, { headers });
+      if (!statusRes.ok) {
+         const errData = await statusRes.json().catch(() => ({}));
+         throw new Error(errData.error || `Failed to check upload status: ${statusRes.status}`);
       }
-    }));
+      const { uploadedChunks } = await statusRes.json();
+      
+      const remainingChunks = [];
+      for (let i = 0; i < totalChunks; i++) {
+         if (!uploadedChunks.includes(i)) remainingChunks.push(i);
+      }
 
-    await Promise.all(tasks);
+      if (remainingChunks.length === 0) {
+         onProgress(100);
+         return;
+      }
+
+      // 2. Upload queue with global concurrency control and retry logic
+      let finishedChunks = totalChunks - remainingChunks.length;
+      
+      const tasks = remainingChunks.map(index => sharedLimit(async () => {
+        let attempts = 0;
+        const maxAttempts = 3;
+
+        while (attempts < maxAttempts) {
+          try {
+            const start = index * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const chunk = file.slice(start, end);
+
+            const formData = new FormData();
+            formData.append('chunk', chunk);
+            formData.append('fileId', fileId);
+            formData.append('index', index.toString());
+            formData.append('total', totalChunks.toString());
+            formData.append('fileName', file.name);
+            formData.append('mimeType', file.type);
+
+            const res = await fetch('/api/admin/upload/chunk', {
+              method: 'POST',
+              headers,
+              body: formData,
+            });
+
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({}));
+              // Don't retry if it's a quota issue
+              if (res.status === 403) throw new Error(errData.error || "Limite atingido (Quota exceeded)");
+              if (res.status === 429) throw new Error("Muitas requisições (Rate Limit)");
+              throw new Error(errData.error || `Upload failed: ${res.status}`);
+            }
+            
+            finishedChunks++;
+            onProgress(Math.round((finishedChunks / totalChunks) * 100));
+            return; // Success
+          } catch (err: any) {
+            attempts++;
+            if (attempts >= maxAttempts || err.message.includes("Limite atingido")) {
+              throw err;
+            }
+            // Exponential backoff
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempts)));
+          }
+        }
+      }));
+
+      await Promise.all(tasks);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
