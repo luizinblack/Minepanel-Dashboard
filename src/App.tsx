@@ -96,6 +96,8 @@ export default function App() {
   const [command, setCommand] = useState("");
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
   const fetchFiles = async (pathStr: string) => {
     try {
       const res = await fetch(`/api/files?path=${encodeURIComponent(pathStr)}`);
@@ -312,6 +314,54 @@ export default function App() {
     } finally {
       setIsUploading(false);
       setTimeout(() => setUploadProgress(0), 2000);
+    }
+  };
+
+  const handleFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsUploading(true);
+    setUploadProgress(0);
+
+    const totalFiles = files.length;
+    let uploadedCount = 0;
+
+    try {
+      // Seq upload for folders to avoid overloading
+      for (let i = 0; i < totalFiles; i++) {
+        const file = files[i];
+        const fullPath = (file as any).webkitRelativePath || file.name;
+        const relativeDir = fullPath.includes('/') ? fullPath.substring(0, fullPath.lastIndexOf('/')) : '';
+        
+        const formData = new FormData();
+        formData.append('relPath', relativeDir);
+        formData.append('file', file);
+
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const errData = await res.json();
+          console.warn(`Erro no arquivo ${fullPath}:`, errData.error);
+        } else {
+          uploadedCount++;
+        }
+        
+        setUploadProgress(Math.round(((i + 1) / totalFiles) * 100));
+      }
+
+      if (activeTab === 'files') fetchFiles(currentPath);
+      alert(`Pasta enviada! ${uploadedCount}/${totalFiles} arquivos subiram com sucesso.`);
+    } catch (err: any) {
+      console.error(err);
+      alert("Erro fatal no upload da pasta: " + err.message);
+    } finally {
+      setIsUploading(false);
+      setUploadProgress(0);
+      if (e.target) e.target.value = '';
     }
   };
 
@@ -934,7 +984,7 @@ export default function App() {
             {/* Jobs Queue UI */}
             <div className="space-y-3 mb-6">
               {jobs.filter(j => j.status !== 'DONE' && j.status !== 'FAILED').length > 0 ? (
-                jobs.filter(j => j.status !== 'DONE' && j.status !== 'FAILED').map(job => (
+                (jobs.filter(j => j.status !== 'DONE' && j.status !== 'FAILED') as ServerJob[]).map(job => (
                   <JobCard key={job.id} job={job} />
                 ))
               ) : (
@@ -960,40 +1010,65 @@ export default function App() {
                  </div>
                </div>
 
-               <label className={cn(
-                 "relative cursor-pointer flex-1 flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl transition-all duration-300 bg-[#1c1c1c] group",
-                 isUploading 
-                    ? "border-[#38e11d]/50 bg-[#38e11d]/5" 
-                    : "border-[#2d2d2d] hover:border-[#38e11d]"
-               )}>
-                  <input type="file" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
-                  <div className={cn(
-                    "w-16 h-16 rounded-full bg-[#242424] flex items-center justify-center mb-4 transition-all duration-300 group-hover:bg-[#38e11d] group-hover:text-black",
-                    isUploading && "animate-pulse"
-                  )}>
-                    <Upload size={24} className={isUploading ? "text-[#38e11d]" : "text-white/40"} />
-                  </div>
-                  <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
-                    {isUploading ? "PROCESSANDO..." : "ANEXAR ARQUIVO"}
-                  </h4>
-                  <p className="text-xs text-slate-500 text-center px-4">
-                    {isUploading ? `Enviando fragmentos: ${uploadProgress}%` : "Arraste qualquer arquivo ou o .zip do seu servidor aqui"}
-                  </p>
-                  
-                  {isUploading && (
-                    <div className="w-full max-w-[200px] mt-4 bg-white/5 h-1.5 rounded-full overflow-hidden border border-white/5">
-                      <motion.div 
-                        initial={{ width: 0 }}
-                        animate={{ width: `${uploadProgress}%` }}
-                        className="h-full bg-[#38e11d] shadow-[0_0_10px_rgba(56,225,29,0.3)]"
-                      />
+                <div className="flex gap-4">
+                 <label className={cn(
+                   "relative cursor-pointer flex-1 flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl transition-all duration-300 bg-[#1c1c1c] group",
+                   isUploading 
+                      ? "border-[#38e11d]/50 bg-[#38e11d]/5" 
+                      : "border-[#2d2d2d] hover:border-[#38e11d]"
+                 )}>
+                    <input type="file" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
+                    <div className={cn(
+                      "w-16 h-16 rounded-full bg-[#242424] flex items-center justify-center mb-4 transition-all duration-300 group-hover:bg-[#38e11d] group-hover:text-black",
+                      isUploading && "animate-pulse"
+                    )}>
+                      <Upload size={24} className={isUploading ? "text-[#38e11d]" : "text-white/40"} />
                     </div>
-                  )}
+                    <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
+                      {isUploading ? "SUBINDO..." : "ARQUIVO"}
+                    </h4>
+                    <p className="text-[10px] text-slate-500 text-center px-4">
+                      {isUploading ? `Progresso: ${uploadProgress}%` : ".zip ou arquivos grandes"}
+                    </p>
+                 </label>
 
-                  <button className="mt-6 w-full py-3 bg-[#2d2d2d] rounded-lg text-[11px] font-black uppercase hover:bg-[#3d3d3d] transition-colors">
-                    {isUploading ? "AGUARDE..." : "EXPLORAR ARQUIVOS"}
-                  </button>
-               </label>
+                 <label className={cn(
+                   "relative cursor-pointer flex-1 flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl transition-all duration-300 bg-[#1c1c1c] group",
+                   isUploading 
+                      ? "border-[#00d1ff]/50 bg-[#00d1ff]/5" 
+                      : "border-[#2d2d2d] hover:border-[#00d1ff]"
+                 )}>
+                    <input 
+                      type="file" 
+                      className="hidden" 
+                      onChange={handleFolderUpload} 
+                      disabled={isUploading} 
+                      {...({ webkitdirectory: "", directory: "", multiple: true } as any)} 
+                    />
+                    <div className={cn(
+                      "w-16 h-16 rounded-full bg-[#242424] flex items-center justify-center mb-4 transition-all duration-300 group-hover:bg-[#00d1ff] group-hover:text-black",
+                      isUploading && "animate-pulse"
+                    )}>
+                      <Folder size={24} className={isUploading ? "text-[#00d1ff]" : "text-white/40"} />
+                    </div>
+                    <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
+                      {isUploading ? "SUBINDO..." : "PASTA"}
+                    </h4>
+                    <p className="text-[10px] text-slate-500 text-center px-4">
+                      {isUploading ? `Progresso: ${uploadProgress}%` : "Mande a pasta inteira"}
+                    </p>
+                 </label>
+                </div>
+
+                {isUploading && (
+                  <div className="w-full mt-4 bg-white/5 h-1.5 rounded-full overflow-hidden border border-white/5">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${uploadProgress}%` }}
+                      className="h-full bg-[#38e11d] shadow-[0_0_10px_rgba(56,225,29,0.3)]"
+                    />
+                  </div>
+                )}
 
                <div className="mt-8 space-y-4">
                   <span className="text-[10px] uppercase font-bold text-slate-500 tracking-[0.2em]">Executável Selecionado</span>
@@ -1114,7 +1189,7 @@ function MetricCard({ label, value, icon, subLabel, color, percentage, className
   );
 }
 
-function JobCard({ job }: { job: ServerJob }) {
+const JobCard: React.FC<{ job: ServerJob }> = ({ job }) => {
   const statusColors = {
     UPLOADING: "text-blue-400",
     UPLOADED: "text-blue-500",

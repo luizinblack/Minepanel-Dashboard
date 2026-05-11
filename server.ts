@@ -55,7 +55,20 @@ fs.writeFileSync(LATEST_LOG_PATH, `--- MineControl Log Started at ${new Date().t
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
+    // Handle subdirectories if relative path is provided in body
+    // Note: relPath must be sent BEFORE the file in the FormData
+    const relPath = req.body.relPath || "";
+    const targetDir = path.join(UPLOADS_DIR, relPath);
+    
+    // Security: Ensure targetDir is inside UPLOADS_DIR
+    if (!targetDir.startsWith(UPLOADS_DIR)) {
+      return cb(new Error("Invalid upload path"), UPLOADS_DIR);
+    }
+
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+    cb(null, targetDir);
   },
   filename: (req, file, cb) => {
     cb(null, file.originalname);
@@ -94,6 +107,14 @@ async function startServer() {
 
   const appendToLog = (data: string) => {
     fs.appendFileSync(LATEST_LOG_PATH, data);
+  };
+
+  const updateJob = (jobId: string, updates: Partial<ServerJob>) => {
+    const jobIndex = jobs.findIndex(j => j.id === jobId);
+    if (jobIndex !== -1) {
+      jobs[jobIndex] = { ...jobs[jobIndex], ...updates };
+      io.emit("job_update", jobs[jobIndex]);
+    }
   };
 
   const logToConsole = (message: string) => {
@@ -345,11 +366,12 @@ async function startServer() {
     }
 
     const { originalname, path: filePath } = req.file;
-    const jobId = `direct-${Date.now()}`;
+    const relPath = req.body.relPath || "";
+    const jobId = `direct-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
     const newJob: ServerJob = {
       id: jobId,
-      filename: originalname,
+      filename: relPath ? path.join(relPath, originalname) : originalname,
       filePath: filePath,
       outputPath: UPLOADS_DIR,
       status: "UPLOADED",
