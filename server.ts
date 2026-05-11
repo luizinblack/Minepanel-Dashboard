@@ -9,6 +9,7 @@ import si from "systeminformation";
 import { spawn, ChildProcess } from "child_process";
 import multer from "multer";
 import fs from "fs";
+import AdmZip from "adm-zip";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,12 +148,32 @@ async function startServer() {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
     }
-    if (req.file.originalname.endsWith('.jar')) {
-        serverJarName = req.file.originalname;
+
+    const { originalname, path: filePath } = req.file;
+
+    if (originalname.endsWith('.zip')) {
+      try {
+        const zip = new AdmZip(filePath);
+        zip.extractAllTo(UPLOADS_DIR, true);
+        // Delete the zip after extraction
+        fs.unlinkSync(filePath);
+        return res.json({ 
+          message: "Files extracted successfully", 
+          filename: originalname,
+          extracted: true
+        });
+      } catch (err: any) {
+        return res.status(500).json({ error: "Failed to extract zip: " + err.message });
+      }
     }
+
+    if (originalname.endsWith('.jar')) {
+        serverJarName = originalname;
+    }
+
     res.json({ 
       message: "File uploaded successfully", 
-      filename: req.file.originalname 
+      filename: originalname 
     });
   });
 
