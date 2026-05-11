@@ -53,6 +53,7 @@ export default function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<any[]>([]);
   const [status, setStatus] = useState<'stopped' | 'starting' | 'running' | 'stopping'>('stopped');
+  const [hasScript, setHasScript] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [currentJar, setCurrentJar] = useState<string>("");
   const [availableJars, setAvailableJars] = useState<string[]>([]);
@@ -94,6 +95,7 @@ export default function App() {
           setStatus(data.status);
           setCurrentJar(data.jar);
           setAvailableJars(data.availableJars);
+          setHasScript(data.hasScript);
         });
     } catch (e) {
       console.warn("API status fetch failed (expected if server hasn't restarted yet)");
@@ -102,10 +104,12 @@ export default function App() {
     socket.on('system_stats', (newStats: SystemStats) => {
       setStats(newStats);
       setStatsHistory(prev => {
+        const cpuVal = parseFloat(newStats.cpuLoad);
+        const ramVal = parseFloat(newStats.ram.percent);
         const next = [...prev, {
           time: newStats.timestamp,
-          cpu: parseFloat(newStats.cpuLoad),
-          ram: parseFloat(newStats.ram.percent)
+          cpu: isNaN(cpuVal) ? 0 : cpuVal,
+          ram: isNaN(ramVal) ? 0 : ramVal
         }].slice(-20);
         return next;
       });
@@ -131,14 +135,10 @@ export default function App() {
   }, [logs]);
 
   const handleStart = async () => {
-    if (!currentJar && availableJars.length > 0) {
-      setCurrentJar(availableJars[0]);
-    }
     try {
       const res = await fetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jar: currentJar || availableJars[0] })
       });
       if (!res.ok) {
         const err = await res.json();
@@ -171,12 +171,26 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok) {
-        setAvailableJars(prev => Array.from(new Set([...prev, data.filename])));
-        if (data.filename.endsWith('.jar')) setCurrentJar(data.filename);
+        setAvailableJars(prev => {
+          const newJars = [...prev, data.filename];
+          if (data.detectedJar) newJars.push(data.detectedJar);
+          return Array.from(new Set(newJars.filter(f => f && f.endsWith('.jar'))));
+        });
+        
+        if (data.filename.endsWith('.jar')) {
+          setCurrentJar(data.filename);
+        } else if (data.detectedJar) {
+          setCurrentJar(data.detectedJar);
+        }
+        
         if (activeTab === 'files') fetchFiles(currentPath);
+        alert(data.message || "Arquivo enviado com sucesso!");
+      } else {
+        alert("Erro no upload: " + (data.error || "Erro desconhecido"));
       }
     } catch (err) {
       console.error(err);
+      alert("Erro ao conectar com o servidor.");
     } finally {
       setIsUploading(false);
     }
@@ -646,6 +660,20 @@ export default function App() {
             <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 mb-6">Configuração Local</h3>
             
             <div className="flex-1 flex flex-col">
+               <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 mb-4">
+                 <div className="flex gap-3">
+                   <div className="w-8 h-8 rounded-lg bg-amber-500/20 flex items-center justify-center shrink-0">
+                     <Activity size={14} className="text-amber-500" />
+                   </div>
+                   <div>
+                     <p className="text-[10px] font-black text-amber-500 uppercase tracking-widest mb-1">Aviso Importante</p>
+                     <p className="text-[11px] text-slate-400 leading-relaxed font-medium">
+                       Renomeie seu arquivo <span className="text-[#38e11d] font-bold">.bat</span> para <span className="text-white bg-white/5 px-1 font-mono">start_server.bat</span> para o painel conseguir ligar o servidor.
+                     </p>
+                   </div>
+                 </div>
+               </div>
+
                <label className={cn(
                  "relative cursor-pointer flex-1 flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl transition-all duration-300 bg-[#1c1c1c] group",
                  isUploading 
@@ -751,6 +779,8 @@ export default function App() {
 }
 
 function MetricCard({ label, value, icon, subLabel, color, percentage, className }: any) {
+  const safePercentage = isNaN(parseFloat(percentage)) ? 0 : parseFloat(percentage);
+  
   return (
     <div className={cn(
       "bg-[#161616] p-6 rounded-2xl border border-[#2d2d2d] shadow-xl hover:bg-[#1c1c1c] transition-all group overflow-hidden relative", 
@@ -758,7 +788,7 @@ function MetricCard({ label, value, icon, subLabel, color, percentage, className
     )}>
       <div className="flex justify-between items-start mb-4 relative z-10">
         <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500">{label}</span>
-        <span className="text-xs font-mono font-bold" style={{ color }}>{percentage}%</span>
+        <span className="text-xs font-mono font-bold" style={{ color }}>{safePercentage.toFixed(1)}%</span>
       </div>
       <div className="text-4xl font-black mb-4 italic text-white flex items-baseline gap-1 relative z-10">
         {value.includes('/') ? (
@@ -773,7 +803,7 @@ function MetricCard({ label, value, icon, subLabel, color, percentage, className
       <div className="w-full bg-[#242424] h-2 rounded-full overflow-hidden relative z-10 p-0.5 border border-white/5">
         <motion.div 
           initial={{ width: 0 }}
-          animate={{ width: `${percentage}%` }}
+          animate={{ width: `${safePercentage}%` }}
           className="h-full rounded-full shadow-[0_0_8px_rgba(255,255,255,0.1)]"
           style={{ backgroundColor: color }}
         />

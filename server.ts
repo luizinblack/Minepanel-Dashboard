@@ -56,39 +56,49 @@ async function startServer() {
 
   // API Routes
   app.get("/api/status", (req, res) => {
+    const files = fs.readdirSync(UPLOADS_DIR);
+    const hasScript = files.some(f => f === 'start_server.bat' || f === 'start_server.sh');
+    
     res.json({ 
       status: serverStatus, 
       jar: serverJarName,
-      availableJars: fs.readdirSync(UPLOADS_DIR).filter(f => f.endsWith('.jar'))
+      availableJars: files.filter(f => f.endsWith('.jar')),
+      hasScript,
+      scriptName: files.find(f => f === 'start_server.bat' || f === 'start_server.sh') || ""
     });
   });
 
   app.post("/api/start", express.json(), (req, res) => {
-    const { jar } = req.body;
-    if (jar) serverJarName = jar;
-
     if (minecraftProcess) {
-      return res.status(400).json({ error: "Server already running" });
+      return res.status(400).json({ error: "O servidor já está rodando." });
     }
 
-    if (!serverJarName) {
-      return res.status(400).json({ error: "No server jar selected" });
-    }
+    const files = fs.readdirSync(UPLOADS_DIR);
+    const script = files.find(f => f === 'start_server.bat' || f === 'start_server.sh');
 
-    const jarPath = path.join(UPLOADS_DIR, serverJarName);
-    
-    if (!fs.existsSync(jarPath)) {
-      return res.status(400).json({ error: "Jar file not found" });
+    if (!script) {
+      return res.status(400).json({ error: "Arquivo 'start_server.bat' não encontrado! Por favor, renomeie seu arquivo de inicialização." });
     }
 
     try {
       serverStatus = "starting";
       io.emit("status_change", { status: serverStatus });
-      io.emit("console_log", `[MineControl] Initializing ${serverJarName}...`);
+      io.emit("console_log", `[MineControl] Iniciando via script: ${script}...`);
 
-      // Using -Xmx1024M -Xms1024M as reasonable defaults. nogui is essential.
-      minecraftProcess = spawn("java", ["-Xmx1024M", "-Xms1024M", "-jar", serverJarName, "nogui"], {
+      const isBat = script.endsWith('.bat');
+      
+      // No Linux/Sandbox, tentamos rodar o .bat como shell se possível ou usamos o interpretador correto
+      const command = isBat ? "sh" : "sh"; // Em ambientes Linux, usamos sh. Se for Windows local real, seria cmd.exe
+      const args = [script];
+
+      // Se for Linux, garantimos permissão de execução
+      if (process.platform !== 'win32') {
+        try { fs.chmodSync(path.join(UPLOADS_DIR, script), '755'); } catch(e) {}
+      }
+
+      minecraftProcess = spawn(command, args, {
         cwd: UPLOADS_DIR,
+        shell: true // Crucial para arquivos de lote/scripts
       });
 
       minecraftProcess.stdout?.on("data", (data) => {
@@ -146,7 +156,7 @@ async function startServer() {
 
   app.post("/api/upload", upload.single("file"), (req: any, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
+      return res.status(400).json({ error: "Nenhum arquivo enviado" });
     }
 
     const { originalname, path: filePath } = req.file;
@@ -155,15 +165,23 @@ async function startServer() {
       try {
         const zip = new AdmZip(filePath);
         zip.extractAllTo(UPLOADS_DIR, true);
-        // Delete the zip after extraction
-        fs.unlinkSync(filePath);
+        
+        // Scan for a .jar file if we don't have one set yet
+        const files = fs.readdirSync(UPLOADS_DIR);
+        const jarFile = files.find(f => f.endsWith('.jar'));
+        if (jarFile && !serverJarName) {
+            serverJarName = jarFile;
+        }
+
+        // Não deletamos o ZIP para que ele apareça na lista de arquivos
         return res.json({ 
-          message: "Files extracted successfully", 
+          message: "Servidor extraído e salvo com sucesso!", 
           filename: originalname,
-          extracted: true
+          extracted: true,
+          detectedJar: jarFile
         });
       } catch (err: any) {
-        return res.status(500).json({ error: "Failed to extract zip: " + err.message });
+        return res.status(500).json({ error: "Falha ao extrair o ZIP: " + err.message });
       }
     }
 
@@ -172,7 +190,7 @@ async function startServer() {
     }
 
     res.json({ 
-      message: "File uploaded successfully", 
+      message: "Arquivo carregado com sucesso!", 
       filename: originalname 
     });
   });
@@ -303,16 +321,25 @@ async function startServer() {
       const mem = await si.mem();
       const gpu = await si.graphics();
       
+      // Filtra adaptadores virtuais (como Parsec, Microsoft Remote Display, etc.)
+      const realGpu = gpu.controllers.find(c => 
+        !c.model.toLowerCase().includes('parsec') && 
+        !c.model.toLowerCase().includes('virtual') &&
+        !c.model.toLowerCase().includes('microsoft remote') &&
+        !c.model.toLowerCase().includes('basic render') &&
+        !c.model.toLowerCase().includes('citrix')
+      ) || gpu.controllers[0];
+
       const stats = {
-        cpuLoad: cpuLoad.currentLoad.toFixed(1),
+        cpuLoad: isNaN(cpuLoad.currentLoad) ? "0.0" : cpuLoad.currentLoad.toFixed(1),
         cpuModel: cachedHardwareInfo.cpuModel,
         ram: {
           used: (mem.active / 1024 / 1024 / 1024).toFixed(2),
           total: (mem.total / 1024 / 1024 / 1024).toFixed(2),
-          percent: ((mem.active / mem.total) * 100).toFixed(1)
+          percent: mem.total > 0 ? ((mem.active / mem.total) * 100).toFixed(1) : "0.0"
         },
-        gpu: gpu.controllers.length > 0 ? gpu.controllers[0].model : "N/A",
-        gpuVram: gpu.controllers.length > 0 ? gpu.controllers[0].vram : 0,
+        gpu: realGpu ? realGpu.model : "N/A",
+        gpuVram: realGpu ? realGpu.vram : 0,
         timestamp: new Date().toLocaleTimeString()
       };
       
