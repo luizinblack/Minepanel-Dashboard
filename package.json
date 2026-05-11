@@ -15,6 +15,7 @@
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "axios": "^1.16.0",
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
@@ -32,9 +33,9 @@
     "vite": "^6.2.3"
   },
   "devDependencies": {
-    "@types/unzipper": "^0.10.11",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/unzipper": "^0.10.11",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",

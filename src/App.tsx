@@ -24,7 +24,8 @@ import {
   X,
   Download,
   ScrollText,
-  RotateCcw
+  RotateCcw,
+  Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -59,7 +60,11 @@ type JobStatus =
   | "UPLOADED"
   | "VALIDATING"
   | "QUEUED"
+  | "DOWNLOADING"
+  | "INSTALLING"
   | "EXTRACTING"
+  | "DETECTING"
+  | "CONFIGURING"
   | "STARTING"
   | "DONE"
   | "FAILED";
@@ -87,13 +92,31 @@ export default function App() {
   const [currentJar, setCurrentJar] = useState<string>("");
   const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace'>('monitor');
   const [currentPath, setCurrentPath] = useState<string>(".");
   const [fileList, setFileList] = useState<any[]>([]);
   const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
   const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
   const [newName, setNewName] = useState("");
   const [command, setCommand] = useState("");
+  
+  // Marketplace States
+  const [marketQuery, setMarketQuery] = useState("");
+  const [marketProjects, setMarketProjects] = useState<any[]>([]);
+  const [isSearchingMarket, setIsSearchingMarket] = useState(false);
+  const [selectedProject, setSelectedProject] = useState<any>(null);
+  const [projectVersions, setProjectVersions] = useState<any[]>([]);
+  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
+  
+  const [marketPage, setMarketPage] = useState(1);
+  const [hasMoreMarket, setHasMoreMarket] = useState(true);
+  const [marketFilterLoader, setMarketFilterLoader] = useState("");
+  const [marketFilterVersion, setMarketFilterVersion] = useState("");
+  const [syncStatus, setSyncStatus] = useState<{ isSyncing: boolean, lastSync: number }>({ isSyncing: false, lastSync: 0 });
+
+  const marketObserver = useRef<IntersectionObserver | null>(null);
+  const marketLastElementRef = useRef<HTMLDivElement | null>(null);
+
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -213,11 +236,20 @@ export default function App() {
 
     fetchInitialData();
 
+    // Check Sync Status periodically
+    const syncInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/marketplace/sync/status');
+        if (res.ok) setSyncStatus(await res.json());
+      } catch (e) {}
+    }, 10000);
+
     return () => {
       socket.off('system_stats');
       socket.off('status_change');
       socket.off('console_log');
       socket.off('job_update');
+      clearInterval(syncInterval);
     };
   }, []);
 
@@ -255,13 +287,16 @@ export default function App() {
     setIsUploading(true);
     setUploadProgress(0);
 
-    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks for better efficiency
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks recommended
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const filename = file.name;
+    const PARALLEL_UPLOADS = 4;
+    let uploadedChunks = 0;
 
     try {
-      // Seq upload for reliability
-      for (let i = 0; i < totalChunks; i++) {
+      const uploadChunk = async (i: number) => {
+        if (i >= totalChunks) return;
+
         let success = false;
         let retries = 3;
 
@@ -287,12 +322,20 @@ export default function App() {
           } catch (err) {
             retries--;
             if (retries === 0) throw err;
-            await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
           }
         }
         
-        setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
+        uploadedChunks++;
+        setUploadProgress(Math.round((uploadedChunks / totalChunks) * 100));
+        await uploadChunk(i + PARALLEL_UPLOADS);
+      };
+
+      const pool = [];
+      for (let i = 0; i < Math.min(PARALLEL_UPLOADS, totalChunks); i++) {
+        pool.push(uploadChunk(i));
       }
+      await Promise.all(pool);
 
       const finalizeRes = await fetch('/api/upload/finalize', {
         method: 'POST',
@@ -323,7 +366,7 @@ export default function App() {
 
     const totalFiles = files.length;
     let uploadedCount = 0;
-    const CONCURRENCY = 3; // Upload 3 files at a time
+    const CONCURRENCY = 6; // Folder uploads can handle more parallel files
 
     try {
       const uploadFile = async (index: number) => {
@@ -331,10 +374,11 @@ export default function App() {
         
         const file = files[index];
         const fullPath = (file as any).webkitRelativePath || file.name;
+        // The spec strictly mandates using webkitRelativePath to preserve structure
         const relativeDir = fullPath.includes('/') ? fullPath.substring(0, fullPath.lastIndexOf('/')) : '';
         
         let success = false;
-        let retries = 2;
+        let retries = 3;
 
         while (!success && retries > 0) {
           try {
@@ -361,14 +405,13 @@ export default function App() {
         await uploadFile(index + CONCURRENCY);
       };
 
-      // Start initial pool
       const pool = [];
       for (let i = 0; i < Math.min(CONCURRENCY, totalFiles); i++) {
         pool.push(uploadFile(i));
       }
       await Promise.all(pool);
 
-      alert(`PASTA ENVIADA: ${uploadedCount}/${totalFiles} arquivos processados.`);
+      alert(`PASTA ENVIADA: ${uploadedCount}/${totalFiles} arquivos processados e em fila.`);
     } catch (err: any) {
       console.error(err);
       alert("Erro fatal no upload da pasta: " + err.message);
@@ -495,6 +538,117 @@ export default function App() {
     }
   };
 
+  const marketplaceActions = {
+    search: async (e?: React.FormEvent, reset: boolean = true) => {
+      e?.preventDefault();
+      
+      const newPage = reset ? 1 : marketPage + 1;
+      if (reset) {
+        setIsSearchingMarket(true);
+        setMarketProjects([]);
+        setMarketPage(1);
+      }
+      
+      try {
+        const params = new URLSearchParams({
+          q: marketQuery,
+          page: newPage.toString(),
+          limit: "20",
+          loader: marketFilterLoader,
+          version: marketFilterVersion
+        });
+        
+        const res = await fetch(`/api/marketplace/search?${params.toString()}`);
+        const data = await res.json();
+        
+        if (reset) {
+          setMarketProjects(data.projects || []);
+        } else {
+          setMarketProjects(prev => [...prev, ...(data.projects || [])]);
+        }
+        
+        setHasMoreMarket(data.hasMore);
+        setMarketPage(newPage);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsSearchingMarket(false);
+      }
+    },
+    triggerSync: async () => {
+      await fetch('/api/marketplace/sync/start', { method: 'POST' });
+      alert("Sincronização forçada iniciada!");
+    },
+    selectProject: async (project: any) => {
+      setSelectedProject(project);
+      setIsLoadingVersions(true);
+      try {
+        const res = await fetch(`/api/marketplace/versions?id=${project.id}&provider=${project.provider}`);
+        const data = await res.json();
+        setProjectVersions(data.versions || []);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsLoadingVersions(false);
+      }
+    },
+    install: async (version: any) => {
+      if (!selectedProject) return;
+      
+      if (!confirm(`Deseja instalar o modpack "${selectedProject.title}" na versão "${version.name}"? Isso pode sobrescrever arquivos existentes.`)) return;
+
+      try {
+        const res = await fetch('/api/marketplace/install', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: selectedProject.id,
+            versionId: version.id,
+            provider: selectedProject.provider,
+            title: selectedProject.title,
+            downloadUrl: selectedProject.provider === 'modrinth' 
+              ? version.files.find((f: any) => f.primary)?.url || version.files[0].url 
+              : version.download_url
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert("Instalação iniciada! Acompanhe o progresso na barra lateral de jobs.");
+          setSelectedProject(null);
+        } else {
+          alert("Erro: " + data.error);
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Erro ao conectar com o servidor.");
+      }
+    }
+  };
+
+  // Infinite Scroll Observer
+  useEffect(() => {
+    if (activeTab !== 'marketplace' || isSearchingMarket || !hasMoreMarket) return;
+
+    if (marketObserver.current) marketObserver.current.disconnect();
+
+    marketObserver.current = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) {
+        marketplaceActions.search(undefined, false);
+      }
+    });
+
+    if (marketLastElementRef.current) marketObserver.current.observe(marketLastElementRef.current);
+    
+    return () => marketObserver.current?.disconnect();
+  }, [marketProjects, activeTab, isSearchingMarket, hasMoreMarket]);
+
+  // Initial marketplace load
+  useEffect(() => {
+    if (activeTab === 'marketplace' && marketProjects.length === 0) {
+      marketplaceActions.search();
+    }
+  }, [activeTab]);
+
   const downloadLogs = () => {
     const element = document.createElement("a");
     const file = new Blob([logs.join('\n')], { type: 'text/plain' });
@@ -592,6 +746,15 @@ export default function App() {
               )}
             >
               Console do Servidor
+            </button>
+            <button 
+              onClick={() => setActiveTab('marketplace')}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
+                activeTab === 'marketplace' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+              )}
+            >
+              <Archive size={12} /> Marketplace
             </button>
           </div>
 
@@ -832,6 +995,279 @@ export default function App() {
                       Pressione ENTER para enviar
                     </div>
                   </div>
+              </motion.div>
+            ) : activeTab === 'marketplace' ? (
+              <motion.div 
+                key="marketplace"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                className="space-y-6 pb-20"
+              >
+                {/* Search Header */}
+                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-8 shadow-xl relative overflow-hidden">
+                  {/* Sync Indicator */}
+                  <div className="absolute top-4 right-4 flex items-center gap-2">
+                    {syncStatus.isSyncing && (
+                      <div className="flex items-center gap-2 px-3 py-1 bg-[#38e11d]/10 border border-[#38e11d]/20 rounded-full animate-pulse">
+                        <RotateCcw size={10} className="text-[#38e11d] animate-spin" />
+                        <span className="text-[8px] font-black uppercase text-[#38e11d] tracking-widest">Sincronizando Database...</span>
+                      </div>
+                    )}
+                    {!syncStatus.isSyncing && syncStatus.lastSync > 0 && (
+                      <span className="text-[8px] font-bold text-slate-600 uppercase tracking-widest">
+                        Última Sinc: {new Date(syncStatus.lastSync).toLocaleTimeString()}
+                      </span>
+                    )}
+                    <button 
+                      onClick={marketplaceActions.triggerSync}
+                      className="p-1.5 hover:bg-white/5 rounded-lg text-slate-600 hover:text-white transition-colors"
+                      title="Sincronizar Manualmente"
+                    >
+                      <RotateCcw size={12} />
+                    </button>
+                  </div>
+
+                  <div className="max-w-2xl mx-auto text-center space-y-4">
+                    <h2 className="text-2xl font-black text-white italic uppercase tracking-tighter">Marketplace de Modpacks</h2>
+                    <p className="text-slate-500 text-sm">Biblioteca global integrada. Explore, escolha e instale instantaneamente.</p>
+                    
+                    <form onSubmit={(e) => marketplaceActions.search(e, true)} className="relative mt-8 group">
+                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-[#38e11d] transition-colors" size={20} />
+                      <input 
+                        type="text" 
+                        value={marketQuery}
+                        onChange={(e) => setMarketQuery(e.target.value)}
+                        placeholder="Procure por 'Better Minecraft', 'All the Mods'..."
+                        className="w-full bg-black/40 border border-[#2d2d2d] rounded-xl pl-12 pr-32 py-4 text-white outline-none focus:border-[#38e11d]/50 transition-all font-medium"
+                      />
+                      <button 
+                        type="submit"
+                        disabled={isSearchingMarket}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 bg-[#38e11d] text-black px-6 py-2 rounded-lg font-black text-xs uppercase hover:bg-[#4cf531] disabled:opacity-50 transition-all"
+                      >
+                        {isSearchingMarket ? 'Buscando...' : 'Pesquisar'}
+                      </button>
+                    </form>
+
+                    {/* Filters Bar */}
+                    <div className="flex flex-wrap items-center justify-center gap-3 mt-6">
+                      <div className="flex items-center gap-2 bg-black/40 border border-[#2d2d2d] rounded-lg px-3 py-1.5">
+                        <span className="text-[8px] font-black uppercase text-slate-500">Versão:</span>
+                        <select 
+                          value={marketFilterVersion}
+                          onChange={(e) => {
+                            setMarketFilterVersion(e.target.value);
+                            // Initial search with new filter
+                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
+                          }}
+                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
+                        >
+                          <option value="" className="bg-[#161616]">Todas</option>
+                          <option value="1.21.1" className="bg-[#161616]">1.21.1</option>
+                          <option value="1.20.1" className="bg-[#161616]">1.20.1</option>
+                          <option value="1.19.2" className="bg-[#161616]">1.19.2</option>
+                          <option value="1.18.2" className="bg-[#161616]">1.18.2</option>
+                          <option value="1.16.5" className="bg-[#161616]">1.16.5</option>
+                          <option value="1.12.2" className="bg-[#161616]">1.12.2</option>
+                        </select>
+                      </div>
+
+                      <div className="flex items-center gap-2 bg-black/40 border border-[#2d2d2d] rounded-lg px-3 py-1.5">
+                        <span className="text-[8px] font-black uppercase text-slate-500">Loader:</span>
+                        <select 
+                          value={marketFilterLoader}
+                          onChange={(e) => {
+                            setMarketFilterLoader(e.target.value);
+                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
+                          }}
+                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
+                        >
+                          <option value="" className="bg-[#161616]">Todos</option>
+                          <option value="forge" className="bg-[#161616]">Forge</option>
+                          <option value="fabric" className="bg-[#161616]">Fabric</option>
+                        </select>
+                      </div>
+
+                      <button 
+                        onClick={() => {
+                          setMarketFilterVersion("");
+                          setMarketFilterLoader("");
+                          setMarketQuery("");
+                          setTimeout(() => marketplaceActions.search(undefined, true), 0);
+                        }}
+                        className="text-[10px] font-black uppercase text-slate-600 hover:text-white transition-colors"
+                      >
+                        Resetar Filtros
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Results Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {marketProjects.map((project, idx) => {
+                    const isLast = idx === marketProjects.length - 1;
+                    return (
+                      <motion.div 
+                        key={`${project.provider}-${project.id}-${idx}`}
+                        ref={isLast ? marketLastElementRef : null}
+                        layoutId={`${project.provider}-${project.id}`}
+                        className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-5 hover:border-[#38e11d]/30 transition-all flex flex-col gap-4 cursor-pointer group"
+                        onClick={() => marketplaceActions.selectProject(project)}
+                      >
+                        <div className="flex gap-4">
+                          <div className="w-16 h-16 bg-black/40 rounded-xl overflow-hidden shrink-0 border border-white/5 group-hover:border-[#38e11d]/20 transition-all">
+                            {project.icon_url ? (
+                              <img src={project.icon_url} alt={project.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center">
+                                <Archive size={20} className="text-slate-700" />
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className={cn(
+                                "text-[7px] font-black uppercase px-1.5 py-0.5 rounded border",
+                                project.provider === 'modrinth' ? "text-green-400 border-green-400/20 bg-green-400/5" : "text-orange-400 border-orange-400/20 bg-orange-400/5"
+                              )}>
+                                {project.provider}
+                              </span>
+                              <h4 className="font-bold text-white truncate text-xs group-hover:text-[#38e11d] transition-colors">{project.title}</h4>
+                            </div>
+                            <p className="text-[10px] text-slate-500 line-clamp-2 leading-relaxed h-8">{project.description}</p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between pt-4 border-t border-white/5">
+                          <div className="flex items-center gap-3 text-[9px] font-bold text-slate-600 uppercase tracking-widest">
+                            <span className="flex items-center gap-1"><Download size={10} /> {project.downloads.toLocaleString()}</span>
+                          </div>
+                          <div className="flex gap-1 overflow-hidden max-w-[80px]">
+                            {project.loaders?.slice(0, 2).map((l: string) => (
+                              <span key={l} className="text-[7px] bg-white/5 text-slate-400 px-1.5 py-0.5 rounded-full border border-white/5 uppercase font-black">{l}</span>
+                            ))}
+                          </div>
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+
+                {isSearchingMarket && (
+                  <div className="py-20 text-center space-y-4">
+                    <RotateCcw className="mx-auto text-[#38e11d] animate-spin" size={32} />
+                    <p className="text-slate-500 text-xs font-bold uppercase tracking-widest animate-pulse">Explorando modpacks...</p>
+                  </div>
+                )}
+
+                {marketProjects.length === 0 && !isSearchingMarket && (
+                  <div className="py-20 text-center space-y-3 bg-[#161616] border border-[#2d2d2d] rounded-3xl">
+                    <Archive size={40} className="mx-auto text-slate-800" />
+                    <p className="text-slate-600 italic">Nenhum modpack encontrado em cache ou na busca.</p>
+                    <button onClick={marketplaceActions.triggerSync} className="text-[#38e11d] text-xs font-bold uppercase border border-[#38e11d]/20 px-4 py-2 rounded-xl mt-4">Sincronizar Agora</button>
+                  </div>
+                )}
+
+                {hasMoreMarket && !isSearchingMarket && marketProjects.length > 0 && (
+                   <div className="py-8 flex justify-center">
+                      <div className="w-8 h-8 rounded-full border-2 border-[#38e11d]/20 border-t-[#38e11d] animate-spin" />
+                   </div>
+                )}
+
+                {/* Project Details Modal */}
+                <AnimatePresence>
+                  {selectedProject && (
+                    <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-8">
+                       <motion.div 
+                         initial={{ scale: 0.95, opacity: 0, y: 20 }}
+                         animate={{ scale: 1, opacity: 1, y: 0 }}
+                         exit={{ scale: 0.95, opacity: 0, y: 20 }}
+                         className="bg-[#161616] border border-[#2d2d2d] rounded-3xl w-full max-w-4xl h-[85vh] flex flex-col shadow-2xl overflow-hidden"
+                       >
+                         {/* Modal Header */}
+                         <div className="p-8 border-b border-[#2d2d2d] bg-[#1a1a1a] flex gap-8">
+                            <div className="w-24 h-24 bg-black/40 rounded-2xl overflow-hidden shrink-0 shadow-xl border border-white/5">
+                               {selectedProject.icon_url ? (
+                                 <img src={selectedProject.icon_url} alt={selectedProject.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                               ) : (
+                                 <div className="w-full h-full flex items-center justify-center"><Archive size={32} className="text-slate-700" /></div>
+                               )}
+                            </div>
+                            <div className="flex-1 space-y-2">
+                               <div className="flex items-center gap-3">
+                                 <span className={cn(
+                                   "text-[10px] font-black uppercase px-2 py-0.5 rounded border",
+                                   selectedProject.provider === 'modrinth' ? "text-green-400 border-green-400/20 bg-green-400/5" : "text-orange-400 border-orange-400/20 bg-orange-400/5"
+                                 )}>
+                                   {selectedProject.provider}
+                                 </span>
+                                 <h2 className="text-2xl font-black text-white uppercase italic tracking-tighter">{selectedProject.title}</h2>
+                               </div>
+                               <p className="text-slate-400 text-sm leading-relaxed">{selectedProject.description}</p>
+                            </div>
+                            <button 
+                              onClick={() => setSelectedProject(null)}
+                              className="self-start p-2 hover:bg-white/5 rounded-full text-slate-500 hover:text-white transition-all"
+                            >
+                              <X size={24} />
+                            </button>
+                         </div>
+
+                         {/* Version List */}
+                         <div className="flex-1 overflow-y-auto custom-scrollbar p-8">
+                            <div className="flex items-center justify-between mb-6">
+                               <h3 className="text-xs font-black uppercase tracking-[0.2em] text-[#38e11d]">Selecione a Versão</h3>
+                               <div className="text-[10px] font-bold text-slate-500 uppercase">Ordenado por data</div>
+                            </div>
+
+                            {isLoadingVersions ? (
+                              <div className="py-20 text-center space-y-4">
+                                <RotateCcw className="mx-auto text-[#38e11d] animate-spin" size={32} />
+                                <p className="text-slate-500 text-xs font-bold uppercase tracking-widest animate-pulse">Carregando versões disponíveis...</p>
+                              </div>
+                            ) : (
+                              <div className="space-y-3">
+                                {projectVersions.map((version) => (
+                                  <div 
+                                    key={version.id}
+                                    className="bg-black/30 border border-[#2d2d2d] rounded-2xl p-5 flex items-center justify-between group hover:border-[#38e11d]/40 transition-all border-l-4 border-l-transparent hover:border-l-[#38e11d]"
+                                  >
+                                    <div className="space-y-1">
+                                      <div className="flex items-center gap-3">
+                                        <h5 className="font-bold text-white mb-0.5">{version.name}</h5>
+                                        <div className="flex gap-1">
+                                          {version.game_versions?.slice(0, 3).map((gv: string) => (
+                                            <span key={gv} className="text-[8px] bg-white/5 text-slate-400 px-1.5 py-0.5 rounded uppercase font-bold">{gv}</span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                      <div className="flex items-center gap-4 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+                                        <span className="text-indigo-400">Minecraft {version.game_versions?.[0]}</span>
+                                        {version.loaders?.length > 0 && (
+                                          <span className="flex items-center gap-1.5">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                            {version.loaders.join(', ')}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <button 
+                                      onClick={() => marketplaceActions.install(version)}
+                                      className="flex items-center gap-3 px-6 py-2.5 bg-[#38e11d] text-black rounded-xl font-black text-xs uppercase hover:bg-[#4cf531] transition-all shadow-lg active:scale-95 group-hover:shadow-[#38e11d]/20"
+                                    >
+                                      <Plus size={14} /> Instalar
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                         </div>
+                       </motion.div>
+                    </div>
+                  )}
+                </AnimatePresence>
               </motion.div>
             ) : (
               <motion.div 
@@ -1209,44 +1645,56 @@ const JobCard: React.FC<{ job: ServerJob }> = ({ job }) => {
     UPLOADED: "text-blue-500",
     VALIDATING: "text-amber-500",
     QUEUED: "text-slate-500",
+    DOWNLOADING: "text-blue-400 font-bold",
+    INSTALLING: "text-[#38e11d]",
     EXTRACTING: "text-[#38e11d]",
-    STARTING: "text-indigo-400",
+    DETECTING: "text-indigo-400",
+    CONFIGURING: "text-purple-400",
+    STARTING: "text-indigo-500",
     DONE: "text-[#38e11d]",
     FAILED: "text-red-500"
   };
 
   const statusLabels = {
-    UPLOADING: "Enviando...",
+    UPLOADING: "Subindo Arquivos",
     UPLOADED: "Enviado",
-    VALIDATING: "Validando Hash...",
-    QUEUED: "Na fila",
-    EXTRACTING: "Extraindo...",
-    STARTING: "Iniciando...",
-    DONE: "Concluído",
-    FAILED: "Falha"
+    VALIDATING: "Validando SHA256",
+    QUEUED: "Aguardando Fila",
+    DOWNLOADING: "Baixando Modpack",
+    INSTALLING: "Instalando",
+    EXTRACTING: "Extraindo Backup",
+    DETECTING: "Escaneando Root",
+    CONFIGURING: "Configurando",
+    STARTING: "Iniciando Worker",
+    DONE: "Deploy Concluído",
+    FAILED: "Falha Crítica"
   };
 
   return (
     <div className="p-4 bg-black/40 border border-[#2d2d2d] rounded-xl flex items-center gap-4 group hover:border-white/10 transition-all">
       <div className={cn(
         "w-10 h-10 rounded-lg flex items-center justify-center shrink-0",
-        job.status === 'FAILED' ? "bg-red-500/10" : "bg-white/5"
+        (job.status === 'EXTRACTING' || job.status === 'DETECTING' || job.status === 'DOWNLOADING') ? "animate-pulse bg-[#38e11d]/10" : "bg-white/5",
+        job.status === 'FAILED' && "bg-red-500/10"
       )}>
         {job.status === 'EXTRACTING' ? <PackageOpen className="text-[#38e11d] animate-bounce" size={18} /> : 
+         job.status === 'DOWNLOADING' ? <Download className="text-blue-400 animate-bounce" size={18} /> :
+         job.status === 'DETECTING' ? <Search className="text-indigo-400" size={18} /> :
          job.status === 'VALIDATING' ? <Activity className="text-amber-500 animate-pulse" size={18} /> :
          job.status === 'UPLOADING' ? <Upload className="text-blue-400 animate-pulse" size={18} /> :
          job.status === 'FAILED' ? <X className="text-red-500" size={18} /> :
+         job.status === 'CONFIGURING' ? <Settings className="text-purple-400 animate-spin" size={18} /> :
          <Archive className="text-slate-400" size={18} />}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex justify-between items-center mb-1">
-          <p className="text-xs font-bold text-white truncate uppercase tracking-tight">{job.filename}</p>
-          <span className={cn("text-[9px] font-black uppercase tracking-widest", statusColors[job.status])}>
-            {statusLabels[job.status]} {job.progress && job.progress < 100 ? `(${job.progress}%)` : ""}
+          <p className="text-xs font-bold text-white truncate uppercase tracking-tight">{(job as any).metadata?.title || job.filename}</p>
+          <span className={cn("text-[9px] font-black uppercase tracking-widest", (statusColors as any)[job.status])}>
+            {(statusLabels as any)[job.status]} {job.progress && job.progress < 100 ? `(${job.progress}%)` : ""}
           </span>
         </div>
         <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
-          {job.status === 'UPLOADING' || job.status === 'EXTRACTING' ? (
+          {['UPLOADING', 'EXTRACTING', 'DOWNLOADING', 'INSTALLING'].includes(job.status) ? (
             <motion.div 
               initial={{ width: 0 }}
               animate={{ width: `${job.progress || 0}%` }}

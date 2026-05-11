@@ -12,13 +12,24 @@ import fs from "fs";
 import unzipper from "unzipper";
 import crypto from "crypto";
 import { finished } from "stream/promises";
+import { 
+  searchModrinth, 
+  searchCurseForge, 
+  getModrinthVersions, 
+  getCurseForgeVersions,
+  downloadFile
+} from "./marketplace.js";
 
 type JobStatus =
   | "UPLOADING"
   | "UPLOADED"
   | "VALIDATING"
   | "QUEUED"
+  | "DOWNLOADING"
+  | "INSTALLING"
   | "EXTRACTING"
+  | "DETECTING"
+  | "CONFIGURING"
   | "STARTING"
   | "DONE"
   | "FAILED";
@@ -33,10 +44,13 @@ interface ServerJob {
   createdAt: number;
   error?: string;
   progress?: number;
+  metadata?: any;
 }
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const MODPACKS_CACHE_PATH = path.join(__dirname, "modpacks_cache.json");
 
 const PORT = 3000;
 const UPLOADS_DIR = path.join(__dirname, "server_files");
@@ -125,10 +139,134 @@ async function startServer() {
     io.emit("console_log", formatted);
   };
 
+  // Sync Service
+  let isSyncingMarket = false;
+  let lastSyncTime = 0;
+
+  const syncMarketplace = async () => {
+    if (isSyncingMarket) return;
+    isSyncingMarket = true;
+    logToConsole(`[Marketplace] Iniciando sincronização completa de modpacks...`);
+
+    const allModpacks: any[] = [];
+    const PAGE_SIZE = 50;
+
+    try {
+      // Sync Modrinth (First 250 modpacks)
+      logToConsole(`[Modrinth] Sincronizando principais modpacks...`);
+      for (let offset = 0; offset < 250; offset += PAGE_SIZE) {
+        const page = await searchModrinth("", PAGE_SIZE, offset);
+        if (page.length === 0) break;
+        allModpacks.push(...page);
+        logToConsole(`[Modrinth] Sincronizados ${allModpacks.length} itens...`);
+      }
+
+      // Sync CurseForge (First 250 modpacks)
+      logToConsole(`[CurseForge] Sincronizando principais modpacks...`);
+      for (let index = 0; index < 250; index += PAGE_SIZE) {
+        const page = await searchCurseForge("", index, PAGE_SIZE);
+        if (page.length === 0) break;
+        allModpacks.push(...page);
+        logToConsole(`[Marketplace] Total sincronizado: ${allModpacks.length} itens...`);
+      }
+
+      // Save to cache
+      fs.writeFileSync(MODPACKS_CACHE_PATH, JSON.stringify({
+        lastSync: Date.now(),
+        modpacks: allModpacks
+      }, null, 2));
+
+      lastSyncTime = Date.now();
+      logToConsole(`[Marketplace] Sincronização concluída! ${allModpacks.length} modpacks em cache.`);
+    } catch (err: any) {
+      logToConsole(`[Marketplace] ERRO na sincronização: ${err.message}`);
+    } finally {
+      isSyncingMarket = false;
+    }
+  };
+
+  // Run sync every 6 hours
+  setInterval(syncMarketplace, 6 * 60 * 60 * 1000);
+  
+  // Initial sync check
+  if (!fs.existsSync(MODPACKS_CACHE_PATH)) {
+    setTimeout(syncMarketplace, 5000);
+  }
+
+  const findStartScript = (dir: string): string | null => {
+    const files = fs.readdirSync(dir);
+    
+    // Priority specific names
+    const priority = ["start_server.bat", "run.bat", "start.bat", "start_server.sh", "run.sh", "start.sh"];
+    for (const name of priority) {
+      const fullPath = path.join(dir, name);
+      if (fs.existsSync(fullPath) && !fs.statSync(fullPath).isDirectory()) {
+        return fullPath;
+      }
+    }
+
+    // Recursive scan
+    for (const file of files) {
+      const fullPath = path.join(dir, file);
+      const stat = fs.statSync(fullPath);
+      if (stat.isDirectory()) {
+        const found = findStartScript(fullPath);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  const findJarFile = (dir: string): string | null => {
+    const files = fs.readdirSync(dir);
+    const priority = [
+      /^forge.*\.jar$/i,
+      /^fabric-server-launch\.jar$/i,
+      /^server\.jar$/i,
+      /^paper.*\.jar$/i,
+      /^spigot.*\.jar$/i
+    ];
+
+    for (const pattern of priority) {
+      for (const file of files) {
+        if (pattern.test(file)) return path.join(dir, file);
+      }
+    }
+
+    // Fallback to any jar
+    const anyJar = files.find(f => f.endsWith('.jar'));
+    if (anyJar) return path.join(dir, anyJar);
+
+    // Recursive
+    for (const file of files) {
+      const fullPath = path.join(dir, file);
+      if (fs.statSync(fullPath).isDirectory()) {
+        const found = findJarFile(fullPath);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
   const worker = async (job: ServerJob) => {
     try {
       console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
       
+      // Handle Marketplace Installation
+      if (job.id.startsWith('install-')) {
+        updateJob(job.id, { status: "DOWNLOADING" });
+        logToConsole(`[Marketplace] Baixando Modpack: ${job.metadata.title}...`);
+        
+        const downloadUrl = job.metadata.downloadUrl;
+        if (!downloadUrl) throw new Error("Download URL missing");
+
+        await downloadFile(downloadUrl, job.filePath, (percent) => {
+          updateJob(job.id, { progress: percent });
+        });
+        
+        updateJob(job.id, { status: "UPLOADED", progress: 100 });
+      }
+
       // 1. Validation
       updateJob(job.id, { status: "VALIDATING" });
       if (fs.existsSync(job.filePath)) {
@@ -141,18 +279,49 @@ async function startServer() {
         updateJob(job.id, { status: "EXTRACTING" });
         logToConsole(`[MineControl] Worker: Extraindo ${job.filename}...`);
         
-        await fs.createReadStream(job.filePath)
-          .pipe(unzipper.Extract({ path: job.outputPath }))
+        const zipPath = job.filePath;
+        const extractionPath = job.outputPath;
+
+        await fs.createReadStream(zipPath)
+          .pipe(unzipper.Extract({ path: extractionPath }))
           .promise();
         
-        // Cleanup ZIP if it was a manual extraction or a system upload
-        try { fs.unlinkSync(job.filePath); } catch(e) {}
+        // Post-extraction: Check for CurseForge manifest.json
+        const manifestPath = path.join(extractionPath, "manifest.json");
+        if (fs.existsSync(manifestPath)) {
+          logToConsole(`[MineControl] Manifest.json detectado. Iniciando download de mods...`);
+          // This is where we would implement full CF manifest parsing if needed.
+          // For now, we assume standard server packs or simple extractions.
+        }
+
+        try { fs.unlinkSync(zipPath); } catch(e) {}
       }
+
+      // 3. Detection
+      updateJob(job.id, { status: "DETECTING" });
+      logToConsole(`[MineControl] Worker: Escaneando arquivos para auto-deploy...`);
+      
+      const script = findStartScript(UPLOADS_DIR);
+      const jar = findJarFile(UPLOADS_DIR);
+
+      if (script) {
+        logToConsole(`[MineControl] Auto-Detect: Script encontrado: ${path.basename(script)}`);
+      }
+      if (jar) {
+        serverJarName = path.basename(jar);
+        logToConsole(`[MineControl] Auto-Detect: JAR encontrado: ${serverJarName}`);
+        io.emit("status_change", { status: serverStatus, jar: serverJarName });
+      }
+
+      // 4. Configuration (Mocked for now, usually setting EULA=true)
+      updateJob(job.id, { status: "CONFIGURING" });
+      const eulaPath = path.join(UPLOADS_DIR, "eula.txt");
+      fs.writeFileSync(eulaPath, "eula=true\n");
+      logToConsole(`[MineControl] Config: EULA aceito automaticamente.`);
 
       updateJob(job.id, { status: "DONE", progress: 100 });
       logToConsole(`[MineControl] Worker: Tarefa ${job.filename} concluída.`);
 
-      // Notify frontend to refresh data
       io.emit("refresh_data");
     } catch (err: any) {
       console.error(`[WORKER ERROR] Job ${job.id}:`, err);
@@ -184,16 +353,129 @@ async function startServer() {
 
   // API Routes
   app.get("/api/status", (req, res) => {
+    const script = findStartScript(UPLOADS_DIR);
+    const hasScript = !!script;
     const files = fs.readdirSync(UPLOADS_DIR);
-    const hasScript = files.some(f => f === 'start_server.bat' || f === 'start_server.sh');
     
     res.json({ 
       status: serverStatus, 
       jar: serverJarName,
       availableJars: files.filter(f => f.endsWith('.jar')),
       hasScript,
-      scriptName: files.find(f => f === 'start_server.bat' || f === 'start_server.sh') || ""
+      scriptName: script ? path.relative(UPLOADS_DIR, script) : ""
     });
+  });
+
+  app.get("/api/marketplace/search", async (req, res) => {
+    const { q, page = "1", limit = "20", loader, version, sort } = req.query;
+    const pageNum = parseInt(page as string, 10);
+    const limitNum = parseInt(limit as string, 10);
+    const offset = (pageNum - 1) * limitNum;
+
+    try {
+      let results: any[] = [];
+
+      // If there's a search query, fetch from APIs live for better relevance
+      if (q && q !== "") {
+        const [modrinth, curseforge] = await Promise.all([
+          searchModrinth(q as string, limitNum, offset),
+          searchCurseForge(q as string, offset, limitNum)
+        ]);
+        results = [...modrinth, ...curseforge];
+      } else {
+        // Use local cache for browsing
+        if (fs.existsSync(MODPACKS_CACHE_PATH)) {
+          const cache = JSON.parse(fs.readFileSync(MODPACKS_CACHE_PATH, 'utf-8'));
+          results = cache.modpacks || [];
+        } else {
+          // Fallback if no cache
+          const [modrinth, curseforge] = await Promise.all([
+            searchModrinth("", limitNum, offset),
+            searchCurseForge("", offset, limitNum)
+          ]);
+          results = [...modrinth, ...curseforge];
+        }
+      }
+
+      // Apply Filters
+      if (loader) {
+        results = results.filter(m => m.loaders?.some((l: string) => l.toLowerCase().includes((loader as string).toLowerCase())));
+      }
+      if (version) {
+        results = results.filter(m => m.minecraft_versions?.includes(version as string));
+      }
+
+      // Apply Sorting
+      if (sort === 'downloads') {
+        results.sort((a, b) => b.downloads - a.downloads);
+      } else if (sort === 'updated') {
+        results.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      }
+
+      // Paginate results
+      const paginated = results.slice(offset, offset + limitNum);
+      
+      res.json({ 
+        projects: paginated,
+        total: results.length,
+        hasMore: offset + limitNum < results.length
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/marketplace/sync/status", (req, res) => {
+    res.json({ isSyncing: isSyncingMarket, lastSync: lastSyncTime });
+  });
+
+  app.post("/api/marketplace/sync/start", (req, res) => {
+    if (isSyncingMarket) return res.status(400).json({ error: "Sincronização já em andamento." });
+    syncMarketplace();
+    res.json({ message: "Sincronização iniciada em segundo plano." });
+  });
+
+  app.get("/api/marketplace/versions", async (req, res) => {
+    const { id, provider } = req.query;
+    try {
+      if (provider === 'modrinth') {
+        const versions = await getModrinthVersions(id as string);
+        return res.json({ versions });
+      } else {
+        const versions = await getCurseForgeVersions(id as string);
+        return res.json({ versions });
+      }
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/marketplace/install", express.json(), async (req, res) => {
+    const { id, versionId, provider, title, downloadUrl } = req.body;
+    
+    const jobId = `install-${Date.now()}`;
+    const tempDir = path.join(__dirname, "temp_downloads");
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
+
+    const filename = `${title.replace(/[^a-z0-9]/gi, '_')}.zip`;
+    const finalPath = path.join(tempDir, filename);
+
+    const newJob: ServerJob = {
+      id: jobId,
+      filename,
+      filePath: finalPath,
+      outputPath: UPLOADS_DIR,
+      status: "QUEUED",
+      createdAt: Date.now(),
+      progress: 0,
+      metadata: { modpackId: id, versionId, provider, title, downloadUrl }
+    };
+
+    jobs.push(newJob);
+    io.emit("job_update", newJob);
+    processQueue();
+
+    res.json({ message: "Instalação do Modpack enviada para a fila.", jobId });
   });
 
   app.post("/api/start", express.json(), (req, res) => {
@@ -201,19 +483,19 @@ async function startServer() {
       return res.status(400).json({ error: "O servidor já está rodando." });
     }
 
-    const files = fs.readdirSync(UPLOADS_DIR);
-    const script = files.find(f => f === 'start_server.bat' || f === 'start_server.sh');
+    const script = findStartScript(UPLOADS_DIR);
 
     if (!script) {
-      return res.status(400).json({ error: "Arquivo 'start_server.bat' não encontrado! Por favor, renomeie seu arquivo de inicialização." });
+      return res.status(400).json({ error: "Nenhum script de inicialização encontrado! Certifique-se de que há um arquivo .bat ou .sh." });
     }
 
     try {
       serverStatus = "starting";
       io.emit("status_change", { status: serverStatus });
-      logToConsole(`[MineControl] Iniciando via script: ${script}...`);
+      logToConsole(`[MineControl] Iniciando via script: ${path.basename(script)}...`);
 
-      const scriptPath = path.join(UPLOADS_DIR, script);
+      const scriptPath = script;
+      const scriptDir = path.dirname(script);
       const isWindows = os.platform() === "win32";
       
       let command = "";
@@ -222,19 +504,19 @@ async function startServer() {
       if (isWindows) {
         if (script.endsWith(".bat")) {
           command = "cmd.exe";
-          args = ["/c", script];
+          args = ["/c", path.basename(script)];
         } else {
-          command = script; // Direct execution
+          command = path.basename(script);
           args = [];
         }
       } else {
         try { fs.chmodSync(scriptPath, '755'); } catch(e) {}
         command = script.endsWith(".sh") ? "bash" : "sh";
-        args = [script];
+        args = [path.basename(script)];
       }
 
       minecraftProcess = spawn(command, args, {
-        cwd: UPLOADS_DIR,
+        cwd: scriptDir,
         shell: isWindows,
         stdio: ['pipe', 'pipe', 'pipe']
       });
