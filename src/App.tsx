@@ -164,19 +164,17 @@ export default function App() {
         }
         return [...prev, updatedJob].slice(-10);
       });
-      
-      // Auto-refresh file list and jar if a job finishes
-      if (updatedJob.status === 'DONE') {
-        fetch('/api/status')
-          .then(res => res.json())
-          .then(data => {
-            setCurrentJar(data.jar);
-            setAvailableJars(data.availableJars);
-          });
-          
-        // Use timeout to allow filesystem to "settle"
-        setTimeout(() => fetchFiles(currentPath), 500);
-      }
+    });
+
+    socket.on('refresh_data', () => {
+      fetch('/api/status')
+        .then(res => res.json())
+        .then(data => {
+          setCurrentJar(data.jar);
+          setAvailableJars(data.availableJars);
+          setHasScript(data.hasScript);
+        });
+      fetchFiles(currentPath);
     });
 
     // Initial data fetch
@@ -257,63 +255,62 @@ export default function App() {
     setIsUploading(true);
     setUploadProgress(0);
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks for better efficiency
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const filename = file.name;
 
     try {
-      // 1. Enviar Chunks
+      // Seq upload for reliability
       for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(file.size, start + CHUNK_SIZE);
-        const chunk = file.slice(start, end);
+        let success = false;
+        let retries = 3;
 
-        const formData = new FormData();
-        formData.append('chunk', chunk);
-        formData.append('filename', filename);
-        formData.append('chunkIndex', i.toString());
-        formData.append('totalChunks', totalChunks.toString());
+        while (!success && retries > 0) {
+          try {
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const chunk = file.slice(start, end);
 
-        const res = await fetch('/api/upload/chunk', {
-          method: 'POST',
-          body: formData,
-        });
+            const formData = new FormData();
+            formData.append('chunk', chunk);
+            formData.append('filename', filename);
+            formData.append('chunkIndex', i.toString());
+            formData.append('totalChunks', totalChunks.toString());
 
-        if (!res.ok) throw new Error(`Falha no envio do fragmento ${i}`);
+            const res = await fetch('/api/upload/chunk', {
+              method: 'POST',
+              body: formData,
+            });
+
+            if (!res.ok) throw new Error(`Status ${res.status}`);
+            success = true;
+          } catch (err) {
+            retries--;
+            if (retries === 0) throw err;
+            await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+          }
+        }
         
-        // Progresso de 0 a 90% (o final é o processamento no backend)
-        setUploadProgress(Math.round(((i + 1) / totalChunks) * 90));
+        setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
       }
 
-      // 2. Finalizar e Extrair no Backend via Sistema
       const finalizeRes = await fetch('/api/upload/finalize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename, totalChunks }),
       });
 
-      const data = await finalizeRes.json();
-      if (finalizeRes.ok) {
-        setUploadProgress(100);
-        setAvailableJars(prev => {
-          const newJars = [...prev];
-          if (data.detectedJar) newJars.push(data.detectedJar);
-          return Array.from(new Set(newJars.filter(f => f && f.endsWith('.jar'))));
-        });
-        
-        if (data.detectedJar) setCurrentJar(data.detectedJar);
-        if (activeTab === 'files') fetchFiles(currentPath);
-        
-        alert(data.message || "Upload concluído com sucesso!");
-      } else {
+      if (!finalizeRes.ok) {
+        const data = await finalizeRes.json();
         throw new Error(data.error || "Erro ao finalizar upload");
       }
     } catch (err: any) {
       console.error(err);
-      alert("Erro no upload do backup: " + err.message);
+      alert("Falha no upload: " + err.message);
     } finally {
       setIsUploading(false);
-      setTimeout(() => setUploadProgress(0), 2000);
+      setUploadProgress(0);
+      if (e.target) e.target.value = '';
     }
   };
 
@@ -326,35 +323,52 @@ export default function App() {
 
     const totalFiles = files.length;
     let uploadedCount = 0;
+    const CONCURRENCY = 3; // Upload 3 files at a time
 
     try {
-      // Seq upload for folders to avoid overloading
-      for (let i = 0; i < totalFiles; i++) {
-        const file = files[i];
+      const uploadFile = async (index: number) => {
+        if (index >= totalFiles) return;
+        
+        const file = files[index];
         const fullPath = (file as any).webkitRelativePath || file.name;
         const relativeDir = fullPath.includes('/') ? fullPath.substring(0, fullPath.lastIndexOf('/')) : '';
         
-        const formData = new FormData();
-        formData.append('relPath', relativeDir);
-        formData.append('file', file);
+        let success = false;
+        let retries = 2;
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData,
-        });
+        while (!success && retries > 0) {
+          try {
+            const formData = new FormData();
+            formData.append('relPath', relativeDir);
+            formData.append('file', file);
 
-        if (!res.ok) {
-          const errData = await res.json();
-          console.warn(`Erro no arquivo ${fullPath}:`, errData.error);
-        } else {
-          uploadedCount++;
+            const res = await fetch('/api/upload', {
+              method: 'POST',
+              body: formData,
+            });
+
+            if (!res.ok) throw new Error("Server error");
+            success = true;
+          } catch (err) {
+            retries--;
+            if (retries === 0) console.warn(`Failed to upload ${fullPath}`);
+            else await new Promise(r => setTimeout(r, 1000));
+          }
         }
-        
-        setUploadProgress(Math.round(((i + 1) / totalFiles) * 100));
-      }
 
-      if (activeTab === 'files') fetchFiles(currentPath);
-      alert(`Pasta enviada! ${uploadedCount}/${totalFiles} arquivos subiram com sucesso.`);
+        if (success) uploadedCount++;
+        setUploadProgress(Math.round(((index + 1) / totalFiles) * 100));
+        await uploadFile(index + CONCURRENCY);
+      };
+
+      // Start initial pool
+      const pool = [];
+      for (let i = 0; i < Math.min(CONCURRENCY, totalFiles); i++) {
+        pool.push(uploadFile(i));
+      }
+      await Promise.all(pool);
+
+      alert(`PASTA ENVIADA: ${uploadedCount}/${totalFiles} arquivos processados.`);
     } catch (err: any) {
       console.error(err);
       alert("Erro fatal no upload da pasta: " + err.message);
@@ -1220,6 +1234,7 @@ const JobCard: React.FC<{ job: ServerJob }> = ({ job }) => {
       )}>
         {job.status === 'EXTRACTING' ? <PackageOpen className="text-[#38e11d] animate-bounce" size={18} /> : 
          job.status === 'VALIDATING' ? <Activity className="text-amber-500 animate-pulse" size={18} /> :
+         job.status === 'UPLOADING' ? <Upload className="text-blue-400 animate-pulse" size={18} /> :
          job.status === 'FAILED' ? <X className="text-red-500" size={18} /> :
          <Archive className="text-slate-400" size={18} />}
       </div>
@@ -1227,15 +1242,14 @@ const JobCard: React.FC<{ job: ServerJob }> = ({ job }) => {
         <div className="flex justify-between items-center mb-1">
           <p className="text-xs font-bold text-white truncate uppercase tracking-tight">{job.filename}</p>
           <span className={cn("text-[9px] font-black uppercase tracking-widest", statusColors[job.status])}>
-            {statusLabels[job.status]}
+            {statusLabels[job.status]} {job.progress && job.progress < 100 ? `(${job.progress}%)` : ""}
           </span>
         </div>
         <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
-          {(job.status === 'EXTRACTING' || job.status === 'UPLOADING') ? (
+          {job.status === 'UPLOADING' || job.status === 'EXTRACTING' ? (
             <motion.div 
-              initial={{ x: "-100%" }}
-              animate={{ x: "0%" }}
-              transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+              initial={{ width: 0 }}
+              animate={{ width: `${job.progress || 0}%` }}
               className="h-full bg-[#38e11d]"
             />
           ) : job.status === 'DONE' ? (

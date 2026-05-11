@@ -97,6 +97,7 @@ async function startServer() {
 
   const getFileHash = async (filePath: string): Promise<string> => {
     return new Promise((resolve, reject) => {
+      if (!fs.existsSync(filePath)) return reject(new Error("File not found"));
       const hash = crypto.createHash("sha256");
       const stream = fs.createReadStream(filePath);
       stream.on("data", (data) => hash.update(data));
@@ -124,6 +125,42 @@ async function startServer() {
     io.emit("console_log", formatted);
   };
 
+  const worker = async (job: ServerJob) => {
+    try {
+      console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
+      
+      // 1. Validation
+      updateJob(job.id, { status: "VALIDATING" });
+      if (fs.existsSync(job.filePath)) {
+        const hash = await getFileHash(job.filePath);
+        updateJob(job.id, { hash });
+      }
+
+      // 2. Extraction
+      if (job.filename.endsWith('.zip')) {
+        updateJob(job.id, { status: "EXTRACTING" });
+        logToConsole(`[MineControl] Worker: Extraindo ${job.filename}...`);
+        
+        await fs.createReadStream(job.filePath)
+          .pipe(unzipper.Extract({ path: job.outputPath }))
+          .promise();
+        
+        // Cleanup ZIP if it was a manual extraction or a system upload
+        try { fs.unlinkSync(job.filePath); } catch(e) {}
+      }
+
+      updateJob(job.id, { status: "DONE", progress: 100 });
+      logToConsole(`[MineControl] Worker: Tarefa ${job.filename} concluída.`);
+
+      // Notify frontend to refresh data
+      io.emit("refresh_data");
+    } catch (err: any) {
+      console.error(`[WORKER ERROR] Job ${job.id}:`, err);
+      updateJob(job.id, { status: "FAILED", error: err.message });
+      logToConsole(`[MineControl] Worker: Falha na Tarefa ${job.filename} - ${err.message}`);
+    }
+  };
+
   const processQueue = async () => {
     if (isProcessingQueue) return;
     isProcessingQueue = true;
@@ -132,37 +169,7 @@ async function startServer() {
       const job = jobs.find(j => j.status === "QUEUED");
       if (!job) break;
 
-      console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
-      try {
-        updateJob(job.id, { status: "EXTRACTING" });
-        logToConsole(`[MineControl] Worker: Extraindo ${job.filename}...`);
-
-        if (job.filename.endsWith('.zip')) {
-          await fs.createReadStream(job.filePath)
-            .pipe(unzipper.Extract({ path: job.outputPath }))
-            .promise();
-          
-          // Cleanup ZIP after extraction if requested (manual extract removes it)
-          if (job.id.startsWith('manual-')) {
-            try { fs.unlinkSync(job.filePath); } catch(e) {}
-          }
-        }
-
-        updateJob(job.id, { status: "DONE" });
-        logToConsole(`[MineControl] Worker: Job ${job.id} finalizado.`);
-
-        // Refresh JAR detection
-        const filesAfter = fs.readdirSync(UPLOADS_DIR);
-        const jarFile = filesAfter.find(f => f.endsWith('.jar'));
-        if (jarFile && !serverJarName) {
-            serverJarName = jarFile;
-            io.emit("status_change", { status: serverStatus, jar: serverJarName });
-        }
-      } catch (err: any) {
-        console.error(`[WORKER ERROR] Job ${job.id}:`, err);
-        updateJob(job.id, { status: "FAILED", error: err.message });
-        logToConsole(`[MineControl] Worker: Falha no Job ${job.id} - ${err.message}`);
-      }
+      await worker(job);
     }
 
     isProcessingQueue = false;
@@ -209,7 +216,6 @@ async function startServer() {
       const scriptPath = path.join(UPLOADS_DIR, script);
       const isWindows = os.platform() === "win32";
       
-      // Determine correct command and arguments based on OS and file type
       let command = "";
       let args: string[] = [];
 
@@ -218,11 +224,10 @@ async function startServer() {
           command = "cmd.exe";
           args = ["/c", script];
         } else {
-          command = "bash"; // Try bash if available on Windows (git bash/WSL)
-          args = [script];
+          command = script; // Direct execution
+          args = [];
         }
       } else {
-        // Linux/Unix environment
         try { fs.chmodSync(scriptPath, '755'); } catch(e) {}
         command = script.endsWith(".sh") ? "bash" : "sh";
         args = [script];
@@ -230,7 +235,8 @@ async function startServer() {
 
       minecraftProcess = spawn(command, args, {
         cwd: UPLOADS_DIR,
-        shell: isWindows // Only use shell: true on Windows for cmd.exe
+        shell: isWindows,
+        stdio: ['pipe', 'pipe', 'pipe']
       });
 
       minecraftProcess.stdout?.on("data", (data) => {
@@ -320,7 +326,8 @@ async function startServer() {
       filePath: finalPath,
       outputPath: UPLOADS_DIR,
       status: "UPLOADING",
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      progress: 0
     };
     jobs.push(newJob);
     io.emit("job_update", newJob);
@@ -334,25 +341,22 @@ async function startServer() {
           const chunkBuffer = fs.readFileSync(chunkPath);
           writeStream.write(chunkBuffer);
           fs.unlinkSync(chunkPath);
+          
+          // Update progress
+          updateJob(jobId, { progress: Math.round(((i + 1) / totalChunks) * 100) });
         }
       }
       
       writeStream.end();
-
       await finished(writeStream);
       
-      console.log(`[UPLOAD] Finalizado: ${filename}. Validando integridade...`);
-      updateJob(jobId, { status: "VALIDATING" });
-      
-      const hash = await getFileHash(finalPath);
-      console.log(`[UPLOAD] SHA256: ${hash}`);
-      
+      console.log(`[UPLOAD] Finalizado: ${filename}. Enviando para fila...`);
       fs.rmSync(chunkDir, { recursive: true, force: true });
       
-      updateJob(jobId, { status: "QUEUED", hash });
-      processQueue(); // Start worker if not running
+      updateJob(jobId, { status: "QUEUED" });
+      processQueue(); 
 
-      res.json({ message: "Upload finalizado e enviado para fila de processamento.", jobId, hash });
+      res.json({ message: "Upload finalizado e enviado para fila de processamento.", jobId });
 
     } catch (err: any) {
       updateJob(jobId, { status: "FAILED", error: err.message });
@@ -374,32 +378,18 @@ async function startServer() {
       filename: relPath ? path.join(relPath, originalname) : originalname,
       filePath: filePath,
       outputPath: UPLOADS_DIR,
-      status: "UPLOADED",
-      createdAt: Date.now()
+      status: "QUEUED",
+      createdAt: Date.now(),
+      progress: 100
     };
     jobs.push(newJob);
     io.emit("job_update", newJob);
+    processQueue();
 
-    try {
-      updateJob(jobId, { status: "VALIDATING" });
-      const hash = await getFileHash(filePath);
-      
-      if (originalname.endsWith('.jar') && !serverJarName) {
-        serverJarName = originalname;
-      }
-
-      updateJob(jobId, { status: "QUEUED", hash });
-      processQueue();
-
-      return res.json({ 
-        message: "Arquivo recebido e enviado para processamento.", 
-        jobId,
-        hash
-      });
-    } catch (err: any) {
-      updateJob(jobId, { status: "FAILED", error: err.message });
-      return res.status(500).json({ error: "Erro ao processar o arquivo: " + err.message });
-    }
+    return res.json({ 
+      message: "Arquivo recebido e enviado para processamento.", 
+      jobId
+    });
   });
 
   // File Manager API
