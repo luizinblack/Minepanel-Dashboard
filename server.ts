@@ -9,7 +9,7 @@ import si from "systeminformation";
 import { spawn, ChildProcess } from "child_process";
 import multer from "multer";
 import fs from "fs";
-import AdmZip from "adm-zip";
+import unzipper from "unzipper";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -194,29 +194,31 @@ async function startServer() {
         fs.rmSync(chunkDir, { recursive: true, force: true });
 
         if (filename.endsWith('.zip')) {
-          console.log(`[ZIP] Iniciando extração pesada via sistema: ${filename}`);
+          console.log(`[ZIP] Iniciando extração pesada via unzipper: ${filename}`);
           io.emit("console_log", `[MineControl] Extraindo arquivo grande: ${filename}...`);
 
-          // Usamos o comando 'unzip' do sistema para eficiência máxima (Task 2 do pedido)
-          const unzip = spawn("unzip", ["-o", filename, "-d", "."], { cwd: UPLOADS_DIR });
+          try {
+            const extractStream = fs.createReadStream(finalPath)
+              .pipe(unzipper.Extract({ path: UPLOADS_DIR }));
 
-          unzip.stdout.on('data', (data) => console.log(`unzip: ${data}`));
-          unzip.stderr.on('data', (data) => console.error(`unzip-err: ${data}`));
-
-          unzip.on('close', (code) => {
-            if (code === 0) {
-              console.log(`[ZIP] Extração concluída via sistema.`);
+            extractStream.on('close', () => {
+              console.log(`[ZIP] Extração concluída via unzipper.`);
               io.emit("console_log", `[MineControl] Extração concluída com sucesso!`);
               
               const files = fs.readdirSync(UPLOADS_DIR);
               const jarFile = files.find(f => f.endsWith('.jar'));
               if (jarFile && !serverJarName) serverJarName = jarFile;
 
-              res.json({ message: "Servidor extraído com sucesso via sistema!", filename, extracted: true });
-            } else {
-              res.status(500).json({ error: "Erro na extração via sistema (unzip). Código: " + code });
-            }
-          });
+              res.json({ message: "Servidor extraído com sucesso!", filename, extracted: true });
+            });
+
+            extractStream.on('error', (err) => {
+              console.error(`[ZIP] Erro na extração: ${err.message}`);
+              res.status(500).json({ error: "Erro na extração via unzipper: " + err.message });
+            });
+          } catch (e: any) {
+             res.status(500).json({ error: "Erro ao iniciar stream de extração: " + e.message });
+          }
         } else {
           res.json({ message: "Arquivo carregado e reconstruído com sucesso!", filename });
         }
@@ -237,23 +239,32 @@ async function startServer() {
     try {
       if (originalname.endsWith('.zip')) {
         console.log(`[ZIP] Iniciando extração de: ${originalname}`);
-        const zip = new AdmZip(filePath);
-        zip.extractAllTo(UPLOADS_DIR, true);
-        console.log(`[ZIP] Extração concluída: ${originalname}`);
         
-        // Scan for a .jar file if we don't have one set yet
-        const files = fs.readdirSync(UPLOADS_DIR);
-        const jarFile = files.find(f => f.endsWith('.jar'));
-        if (jarFile && !serverJarName) {
-            serverJarName = jarFile;
-        }
+        fs.createReadStream(filePath)
+          .pipe(unzipper.Extract({ path: UPLOADS_DIR }))
+          .on('close', () => {
+            console.log(`[ZIP] Extração concluída: ${originalname}`);
+            
+            // Scan for a .jar file
+            const files = fs.readdirSync(UPLOADS_DIR);
+            const jarFile = files.find(f => f.endsWith('.jar'));
+            if (jarFile && !serverJarName) {
+                serverJarName = jarFile;
+            }
 
-        return res.json({ 
-          message: "Servidor extraído e salvo com sucesso!", 
-          filename: originalname,
-          extracted: true,
-          detectedJar: jarFile
-        });
+            res.json({ 
+              message: "Servidor extraído e salvo com sucesso!", 
+              filename: originalname,
+              extracted: true,
+              detectedJar: jarFile
+            });
+          })
+          .on('error', (err) => {
+            console.error("Unzip error:", err);
+            res.status(500).json({ error: "Erro ao extrair arquivo: " + err.message });
+          });
+          
+        return; // Retornamos aqui pois o res.json está no callback
       }
 
       if (originalname.endsWith('.jar')) {
@@ -309,14 +320,14 @@ async function startServer() {
 
     const extractDir = path.dirname(filePath);
     
-    console.log(`[ZIP] Extraindo manual: ${filename} em ${extractDir}`);
+    console.log(`[ZIP] Extraindo manual via unzipper: ${filename} em ${extractDir}`);
     io.emit("console_log", `[MineControl] Extraindo manual: ${filename}...`);
 
-    // Usamos o comando system unzip para eficiência (Task 2)
-    const unzip = spawn("unzip", ["-o", filename, "-d", "."], { cwd: extractDir });
+    try {
+      const extractStream = fs.createReadStream(filePath)
+        .pipe(unzipper.Extract({ path: extractDir }));
 
-    unzip.on('close', (code) => {
-      if (code === 0) {
+      extractStream.on('close', () => {
         try {
           fs.unlinkSync(filePath); // Exclui o ZIP após extrair conforme solicitado
           io.emit("console_log", `[MineControl] Extraído com sucesso. Arquivo ${filename} removido.`);
@@ -324,14 +335,15 @@ async function startServer() {
         } catch (e: any) {
           res.json({ message: "Extraído, mas houve um erro ao remover o ZIP: " + e.message });
         }
-      } else {
-        res.status(500).json({ error: "Erro na extração do sistema. Código: " + code });
-      }
-    });
+      });
 
-    unzip.stderr.on('data', (data) => {
-      console.error(`Unzip Error output: ${data}`);
-    });
+      extractStream.on('error', (err) => {
+        console.error(`[ZIP] Erro na extração manual: ${err.message}`);
+        res.status(500).json({ error: "Erro na extração via unzipper: " + err.message });
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: "Falha ao iniciar extração: " + err.message });
+    }
   });
 
   app.get("/api/file/read", (req, res) => {
