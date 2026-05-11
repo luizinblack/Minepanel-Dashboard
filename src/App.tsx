@@ -52,6 +52,7 @@ interface SystemStats {
 export default function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<any[]>([]);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [status, setStatus] = useState<'stopped' | 'starting' | 'running' | 'stopping'>('stopped');
   const [hasScript, setHasScript] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
@@ -158,41 +159,69 @@ export default function App() {
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files?.[0]) return;
-    
+    const file = e.target.files?.[0];
+    if (!file) return;
+
     setIsUploading(true);
-    const formData = new FormData();
-    formData.append('file', e.target.files[0]);
+    setUploadProgress(0);
+
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const filename = file.name;
 
     try {
-      const res = await fetch('/api/upload', {
+      // 1. Enviar Chunks
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const chunk = file.slice(start, end);
+
+        const formData = new FormData();
+        formData.append('chunk', chunk);
+        formData.append('filename', filename);
+        formData.append('chunkIndex', i.toString());
+        formData.append('totalChunks', totalChunks.toString());
+
+        const res = await fetch('/api/upload/chunk', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!res.ok) throw new Error(`Falha no envio do fragmento ${i}`);
+        
+        // Progresso de 0 a 90% (o final é o processamento no backend)
+        setUploadProgress(Math.round(((i + 1) / totalChunks) * 90));
+      }
+
+      // 2. Finalizar e Extrair no Backend via Sistema
+      const finalizeRes = await fetch('/api/upload/finalize', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename, totalChunks }),
       });
-      const data = await res.json();
-      if (res.ok) {
+
+      const data = await finalizeRes.json();
+      if (finalizeRes.ok) {
+        setUploadProgress(100);
         setAvailableJars(prev => {
-          const newJars = [...prev, data.filename];
+          const newJars = [...prev];
           if (data.detectedJar) newJars.push(data.detectedJar);
           return Array.from(new Set(newJars.filter(f => f && f.endsWith('.jar'))));
         });
         
-        if (data.filename.endsWith('.jar')) {
-          setCurrentJar(data.filename);
-        } else if (data.detectedJar) {
-          setCurrentJar(data.detectedJar);
-        }
-        
+        if (data.detectedJar) setCurrentJar(data.detectedJar);
         if (activeTab === 'files') fetchFiles(currentPath);
-        alert(data.message || "Arquivo enviado com sucesso!");
+        
+        alert(data.message || "Upload concluído com sucesso!");
       } else {
-        alert("Erro no upload: " + (data.error || "Erro desconhecido"));
+        throw new Error(data.error || "Erro ao finalizar upload");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Erro ao conectar com o servidor.");
+      alert("Erro no upload do backup: " + err.message);
     } finally {
       setIsUploading(false);
+      setTimeout(() => setUploadProgress(0), 2000);
     }
   };
 
@@ -691,8 +720,19 @@ export default function App() {
                     {isUploading ? "PROCESSANDO..." : "ANEXAR ARQUIVO"}
                   </h4>
                   <p className="text-xs text-slate-500 text-center px-4">
-                    {isUploading ? "Processando arquivos..." : "Arraste qualquer arquivo ou o .zip do seu servidor aqui"}
+                    {isUploading ? `Enviando fragmentos: ${uploadProgress}%` : "Arraste qualquer arquivo ou o .zip do seu servidor aqui"}
                   </p>
+                  
+                  {isUploading && (
+                    <div className="w-full max-w-[200px] mt-4 bg-white/5 h-1.5 rounded-full overflow-hidden border border-white/5">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${uploadProgress}%` }}
+                        className="h-full bg-[#38e11d] shadow-[0_0_10px_rgba(56,225,29,0.3)]"
+                      />
+                    </div>
+                  )}
+
                   <button className="mt-6 w-full py-3 bg-[#2d2d2d] rounded-lg text-[11px] font-black uppercase hover:bg-[#3d3d3d] transition-colors">
                     {isUploading ? "AGUARDE..." : "EXPLORAR ARQUIVOS"}
                   </button>

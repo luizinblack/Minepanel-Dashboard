@@ -154,7 +154,80 @@ async function startServer() {
     res.json({ message: "Stopping server" });
   });
 
+  // API de Upload em Chunks
+  const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks");
+  if (!fs.existsSync(CHUNKS_TEMP_DIR)) fs.mkdirSync(CHUNKS_TEMP_DIR);
+
+  app.post("/api/upload/chunk", multer().single("chunk"), (req: any, res) => {
+    const { filename, chunkIndex, totalChunks } = req.body;
+    const chunk = req.file;
+
+    if (!chunk) return res.status(400).json({ error: "No chunk received" });
+
+    const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
+    if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
+
+    const chunkPath = path.join(chunkDir, `chunk-${chunkIndex}`);
+    fs.writeFileSync(chunkPath, chunk.buffer);
+
+    res.json({ success: true, message: `Chunk ${chunkIndex}/${totalChunks} saved` });
+  });
+
+  app.post("/api/upload/finalize", express.json(), async (req, res) => {
+    const { filename, totalChunks } = req.body;
+    const finalPath = path.join(UPLOADS_DIR, filename);
+    const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
+
+    try {
+      const writeStream = fs.createWriteStream(finalPath);
+      
+      for (let i = 0; i < totalChunks; i++) {
+        const chunkPath = path.join(chunkDir, `chunk-${i}`);
+        const chunkBuffer = fs.readFileSync(chunkPath);
+        writeStream.write(chunkBuffer);
+        fs.unlinkSync(chunkPath); // Limpa o chunk após usar
+      }
+      
+      writeStream.end();
+
+      writeStream.on('finish', async () => {
+        fs.rmSync(chunkDir, { recursive: true, force: true });
+
+        if (filename.endsWith('.zip')) {
+          console.log(`[ZIP] Iniciando extração pesada via sistema: ${filename}`);
+          io.emit("console_log", `[MineControl] Extraindo arquivo grande: ${filename}...`);
+
+          // Usamos o comando 'unzip' do sistema para eficiência máxima (Task 2 do pedido)
+          const unzip = spawn("unzip", ["-o", filename, "-d", "."], { cwd: UPLOADS_DIR });
+
+          unzip.stdout.on('data', (data) => console.log(`unzip: ${data}`));
+          unzip.stderr.on('data', (data) => console.error(`unzip-err: ${data}`));
+
+          unzip.on('close', (code) => {
+            if (code === 0) {
+              console.log(`[ZIP] Extração concluída via sistema.`);
+              io.emit("console_log", `[MineControl] Extração concluída com sucesso!`);
+              
+              const files = fs.readdirSync(UPLOADS_DIR);
+              const jarFile = files.find(f => f.endsWith('.jar'));
+              if (jarFile && !serverJarName) serverJarName = jarFile;
+
+              res.json({ message: "Servidor extraído com sucesso via sistema!", filename, extracted: true });
+            } else {
+              res.status(500).json({ error: "Erro na extração via sistema (unzip). Código: " + code });
+            }
+          });
+        } else {
+          res.json({ message: "Arquivo carregado e reconstruído com sucesso!", filename });
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: "Erro ao finalizar upload: " + err.message });
+    }
+  });
+
   app.post("/api/upload", upload.single("file"), (req: any, res) => {
+
     if (!req.file) {
       return res.status(400).json({ error: "Nenhum arquivo enviado" });
     }
@@ -332,13 +405,17 @@ async function startServer() {
         !c.model.toLowerCase().includes('citrix')
       ) || gpu.controllers[0];
 
+      // Fallback for RAM if si returns 0
+      const totalRam = mem.total > 0 ? mem.total : os.totalmem();
+      const usedRam = mem.used > 0 ? mem.used : (os.totalmem() - os.freemem());
+
       const stats = {
         cpuLoad: isNaN(cpuLoad.currentLoad) ? "0.0" : cpuLoad.currentLoad.toFixed(1),
         cpuModel: cachedHardwareInfo.cpuModel,
         ram: {
-          used: (mem.active / 1024 / 1024 / 1024).toFixed(2),
-          total: (mem.total / 1024 / 1024 / 1024).toFixed(2),
-          percent: mem.total > 0 ? ((mem.active / mem.total) * 100).toFixed(1) : "0.0"
+          used: (usedRam / 1024 / 1024 / 1024).toFixed(2),
+          total: (totalRam / 1024 / 1024 / 1024).toFixed(2),
+          percent: totalRam > 0 ? ((usedRam / totalRam) * 100).toFixed(1) : "0.0"
         },
         gpu: realGpu ? realGpu.model : "N/A",
         gpuVram: realGpu ? realGpu.vram : 0,
