@@ -161,10 +161,12 @@ async function startServer() {
 
     const { originalname, path: filePath } = req.file;
 
-    if (originalname.endsWith('.zip')) {
-      try {
+    try {
+      if (originalname.endsWith('.zip')) {
+        console.log(`[ZIP] Iniciando extração de: ${originalname}`);
         const zip = new AdmZip(filePath);
         zip.extractAllTo(UPLOADS_DIR, true);
+        console.log(`[ZIP] Extração concluída: ${originalname}`);
         
         // Scan for a .jar file if we don't have one set yet
         const files = fs.readdirSync(UPLOADS_DIR);
@@ -173,26 +175,26 @@ async function startServer() {
             serverJarName = jarFile;
         }
 
-        // Não deletamos o ZIP para que ele apareça na lista de arquivos
         return res.json({ 
           message: "Servidor extraído e salvo com sucesso!", 
           filename: originalname,
           extracted: true,
           detectedJar: jarFile
         });
-      } catch (err: any) {
-        return res.status(500).json({ error: "Falha ao extrair o ZIP: " + err.message });
       }
-    }
 
-    if (originalname.endsWith('.jar')) {
-        serverJarName = originalname;
-    }
+      if (originalname.endsWith('.jar')) {
+          serverJarName = originalname;
+      }
 
-    res.json({ 
-      message: "Arquivo carregado com sucesso!", 
-      filename: originalname 
-    });
+      return res.json({ 
+        message: "Arquivo carregado com sucesso!", 
+        filename: originalname 
+      });
+    } catch (err: any) {
+      console.error("Upload error:", err);
+      return res.status(500).json({ error: "Erro ao processar o arquivo: " + err.message });
+    }
   });
 
   // File Manager API

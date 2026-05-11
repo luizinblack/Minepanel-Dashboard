@@ -680,7 +680,7 @@ export default function App() {
                     ? "border-[#38e11d]/50 bg-[#38e11d]/5" 
                     : "border-[#2d2d2d] hover:border-[#38e11d]"
                )}>
-                  <input type="file" className="hidden" accept=".jar,.zip" onChange={handleFileUpload} disabled={isUploading} />
+                  <input type="file" className="hidden" onChange={handleFileUpload} disabled={isUploading} />
                   <div className={cn(
                     "w-16 h-16 rounded-full bg-[#242424] flex items-center justify-center mb-4 transition-all duration-300 group-hover:bg-[#38e11d] group-hover:text-black",
                     isUploading && "animate-pulse"
@@ -688,10 +688,10 @@ export default function App() {
                     <Upload size={24} className={isUploading ? "text-[#38e11d]" : "text-white/40"} />
                   </div>
                   <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
-                    {isUploading ? "PROCESSANDO..." : "ANEXAR SERVIDOR"}
+                    {isUploading ? "PROCESSANDO..." : "ANEXAR ARQUIVO"}
                   </h4>
                   <p className="text-xs text-slate-500 text-center px-4">
-                    {isUploading ? "Extraindo arquivos do servidor..." : "Arraste o .jar ou .zip do seu servidor pronto aqui"}
+                    {isUploading ? "Processando arquivos..." : "Arraste qualquer arquivo ou o .zip do seu servidor aqui"}
                   </p>
                   <button className="mt-6 w-full py-3 bg-[#2d2d2d] rounded-lg text-[11px] font-black uppercase hover:bg-[#3d3d3d] transition-colors">
                     {isUploading ? "AGUARDE..." : "EXPLORAR ARQUIVOS"}
