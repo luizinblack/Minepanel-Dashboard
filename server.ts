@@ -132,11 +132,24 @@ async function startServer() {
   
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 1000, // Limit each IP to 1000 requests per windowMs
+    max: 1000,
     message: { error: "Muitas requisições, tente novamente mais tarde." },
     validate: { trustProxy: false },
   });
+
+  const uploadLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100000, // 100k requests for high-volume uploads
+    message: { error: "Limite de upload atingido." },
+    validate: { trustProxy: false },
+  });
+
+  // Apply general limiter to all API routes
   app.use("/api/", limiter);
+
+  // Override with more permissive limiter for upload routes
+  app.use("/api/admin/upload/", uploadLimiter);
+  app.use("/api/admin/upload/status", uploadLimiter);
 
   const httpServer = createServer(app);
   const io = new Server(httpServer, {

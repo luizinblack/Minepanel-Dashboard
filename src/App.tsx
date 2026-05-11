@@ -195,18 +195,22 @@ export default function App() {
 
   useEffect(() => {
     // Initial status fetch
-    try {
-      fetch('/api/status')
-        .then(res => res.json())
-        .then(data => {
+    const fetchMinimalStatus = async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) {
+          const data = await res.json();
           setStatus(data.status);
           setCurrentJar(data.jar);
           setAvailableJars(data.availableJars);
           setHasScript(data.hasScript);
-        });
-    } catch (e) {
-      console.warn("API status fetch failed (expected if server hasn't restarted yet)");
-    }
+        }
+      } catch (e) {
+        console.warn("API status fetch failed");
+      }
+    };
+
+    fetchMinimalStatus();
 
     socket.on('system_metrics', (newMetrics: SystemStats) => {
       setStats(newMetrics);
@@ -244,26 +248,27 @@ export default function App() {
     });
 
     socket.on('refresh_data', () => {
-      fetch('/api/status')
-        .then(res => res.json())
-        .then(data => {
-          setCurrentJar(data.jar);
-          setAvailableJars(data.availableJars);
-          setHasScript(data.hasScript);
-        });
+      fetchMinimalStatus();
       fetchFiles(currentPath);
-      fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs).catch(() => {});
+      fetch('/api/admin/logs')
+        .then(res => res.json())
+        .then(data => Array.isArray(data) ? setAuditLogs(data) : setAuditLogs([]))
+        .catch(() => setAuditLogs([]));
     });
 
-    // Initial audit logs fetch
-    fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs).catch(() => {});
+    // Removed redundant Initial audit logs fetch (centralized in fetchInitialData)
 
     // Initial data fetch
     const fetchInitialData = async () => {
+      if (isUploading) return;
       try {
-        const [statusRes, jobsRes] = await Promise.all([
+        const [statusRes, jobsRes, logsRes, auditRes] = await Promise.all([
           fetch('/api/status'),
-          fetch('/api/jobs')
+          fetch('/api/jobs'),
+          fetch('/api/logs'),
+          fetch('/api/admin/logs', {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
+          })
         ]);
         
         if (statusRes.ok) {
@@ -276,16 +281,19 @@ export default function App() {
         
         if (jobsRes.ok) {
           const jobsData = await jobsRes.json();
-          setJobs(jobsData);
+          if (Array.isArray(jobsData)) setJobs(jobsData);
         }
 
-        // Fetch initial logs
-        const logsRes = await fetch('/api/logs');
         if (logsRes.ok) {
           const logsData = await logsRes.json();
           if (logsData.content) {
             setLogs(logsData.content.split('\n').filter((l: string) => l.length > 0));
           }
+        }
+
+        if (auditRes.ok) {
+          const auditData = await auditRes.json();
+          setAuditLogs(Array.isArray(auditData) ? auditData : []);
         }
       } catch (e) {
         console.warn("Initial data fetch failed");
@@ -1036,7 +1044,7 @@ export default function App() {
                        <h3 className="text-xs font-black uppercase tracking-[0.2em] text-white">Auditoria de Eventos</h3>
                     </div>
                     <button 
-                      onClick={() => fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs)}
+                      onClick={() => fetch('/api/admin/logs').then(res => res.json()).then(data => Array.isArray(data) ? setAuditLogs(data) : setAuditLogs([]))}
                       className="text-[10px] font-bold text-slate-500 hover:text-white uppercase transition-colors"
                     >
                       Atualizar
