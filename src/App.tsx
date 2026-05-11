@@ -377,7 +377,7 @@ export default function App() {
       const { 
         onProgress = () => {}, 
         fileId = `${file.name}-${file.size}-${file.lastModified}`,
-        CHUNK_SIZE = 5 * 1024 * 1024, // 5MB per chunk (optimized for large sets)
+        CHUNK_SIZE = 50 * 1024 * 1024, // 50MB per chunk (optimized for large sets)
         sharedLimit = globalUploadLimit
       } = options;
 
@@ -452,7 +452,12 @@ export default function App() {
         }
       }));
 
-      await Promise.all(tasks);
+      const results = await Promise.allSettled(tasks);
+      const failed = results.filter(r => r.status === "rejected");
+      if (failed.length > 0) {
+        const firstError: any = failed[0];
+        throw new Error(`${failed.length} chunks falharam. Exemplo: ${firstError.reason?.message || "Unknown error"}`);
+      }
     } finally {
       setIsUploading(false);
     }

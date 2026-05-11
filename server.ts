@@ -132,7 +132,7 @@ async function startServer() {
   
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 1000, // Balanced for UI interactions
+    max: 5000,
     message: { error: "Muitas requisições, tente novamente mais tarde." },
     standardHeaders: true,
     legacyHeaders: false,
@@ -142,17 +142,17 @@ async function startServer() {
 
   const uploadLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100000, // 100k requests for high-volume uploads
+    max: 500000, // uploads chunked precisam muitas requests
     message: { error: "Limite de upload atingido." },
     standardHeaders: true,
     legacyHeaders: false,
     validate: { trustProxy: false },
   });
 
-  // Apply permissive limiter to upload routes FIRST
+  // IMPORTANTE: upload limiter deve vir PRIMEIRO
   app.use("/api/admin/upload", uploadLimiter);
 
-  // Apply general limiter to all other API routes
+  // limiter global vem DEPOIS
   app.use("/api/", limiter);
 
   const httpServer = createServer(app);
@@ -261,6 +261,26 @@ async function startServer() {
 
   updateMetrics();
   setInterval(updateMetrics, 2000);
+
+  // Cleanup incomplete uploads every 10 minutes
+  setInterval(() => {
+    try {
+      if (!fs.existsSync(CHUNKS_TEMP_DIR)) return;
+      const dirs = fs.readdirSync(CHUNKS_TEMP_DIR);
+      for (const dir of dirs) {
+        const full = path.join(CHUNKS_TEMP_DIR, dir);
+        const stat = fs.statSync(full);
+        const age = Date.now() - stat.mtimeMs;
+        // remove uploads abandonados após 1 hora
+        if (age > 1000 * 60 * 60) {
+          fs.rmSync(full, { recursive: true, force: true });
+          console.log(`[MineControl] Limpeza: Removido upload incompleto expirado: ${dir}`);
+        }
+      }
+    } catch (e) {
+      console.error("Erro na limpeza de chunks temporários:", e);
+    }
+  }, 1000 * 60 * 10);
 
   // Centralized Logger
   const auditLog = (level: "info" | "warn" | "error", message: string, details?: any) => {
@@ -1188,24 +1208,41 @@ async function startServer() {
 
   // File Manager API
   app.get("/api/files", (req, res) => {
-    const relativePath = (req.query.path as string) || ".";
-    const fullPath = path.join(UPLOADS_DIR, relativePath);
-
-    if (!fullPath.startsWith(UPLOADS_DIR)) {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
     try {
-      const files = fs.readdirSync(fullPath, { withFileTypes: true });
-      const result = files.map(file => ({
-        name: file.name,
-        isDirectory: file.isDirectory(),
-        size: file.isDirectory() ? 0 : fs.statSync(path.join(fullPath, file.name)).size,
-        mtime: fs.statSync(path.join(fullPath, file.name)).mtime
-      }));
-      res.json(result);
+      const results: any[] = [];
+  
+      const scanDir = (dir: string, relative = "") => {
+        if (!fs.existsSync(dir)) return;
+  
+        const items = fs.readdirSync(dir);
+  
+        for (const item of items) {
+          const fullPath = path.join(dir, item);
+          const stat = fs.statSync(fullPath);
+  
+          if (stat.isDirectory()) {
+            scanDir(fullPath, path.join(relative, item));
+          } else {
+            results.push({
+              name: item,
+              path: path.join(relative, item),
+              size: stat.size,
+              uploadedAt: stat.birthtime,
+              type: "file"
+            });
+          }
+        }
+      };
+  
+      scanDir(STANDARDIZED_UPLOADS_DIR);
+  
+      res.json(results);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      console.error(err);
+  
+      res.status(500).json({
+        error: "Erro ao listar arquivos"
+      });
     }
   });
 
