@@ -156,6 +156,116 @@ async function startServer() {
     });
   });
 
+  // File Manager API
+  app.get("/api/files", (req, res) => {
+    const relativePath = (req.query.path as string) || ".";
+    const fullPath = path.join(UPLOADS_DIR, relativePath);
+
+    if (!fullPath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    try {
+      const files = fs.readdirSync(fullPath, { withFileTypes: true });
+      const result = files.map(file => ({
+        name: file.name,
+        isDirectory: file.isDirectory(),
+        size: file.isDirectory() ? 0 : fs.statSync(path.join(fullPath, file.name)).size,
+        mtime: fs.statSync(path.join(fullPath, file.name)).mtime
+      }));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/file/read", (req, res) => {
+    const filePath = req.query.path as string;
+    if (!filePath) return res.status(400).json({ error: "Path required" });
+
+    const fullPath = path.join(UPLOADS_DIR, filePath);
+    if (!fullPath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    try {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      res.json({ content });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/file/write", express.json(), (req, res) => {
+    const { path: filePath, content } = req.body;
+    if (!filePath) return res.status(400).json({ error: "Path required" });
+
+    const fullPath = path.join(UPLOADS_DIR, filePath);
+    if (!fullPath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    try {
+      fs.writeFileSync(fullPath, content, 'utf-8');
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/file/delete", express.json(), (req, res) => {
+    const { path: filePath } = req.body;
+    if (!filePath) return res.status(400).json({ error: "Path required" });
+
+    const fullPath = path.join(UPLOADS_DIR, filePath);
+    if (!fullPath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    try {
+      if (fs.statSync(fullPath).isDirectory()) {
+        fs.rmSync(fullPath, { recursive: true, force: true });
+      } else {
+        fs.unlinkSync(fullPath);
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/file/create", express.json(), (req, res) => {
+    const { path: filePath, isDirectory } = req.body;
+    if (!filePath) return res.status(400).json({ error: "Path required" });
+
+    const fullPath = path.join(UPLOADS_DIR, filePath);
+    if (!fullPath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    try {
+      if (isDirectory) {
+        fs.mkdirSync(fullPath, { recursive: true });
+      } else {
+        fs.writeFileSync(fullPath, "", 'utf-8');
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/command", express.json(), (req, res) => {
+    const { command } = req.body;
+    if (!minecraftProcess) {
+      return res.status(400).json({ error: "Server is not running" });
+    }
+    if (!command) return res.status(400).json({ error: "Command required" });
+
+    minecraftProcess.stdin?.write(command + "\n");
+    res.json({ success: true });
+  });
+
   // Socket.io stats broadcasting
   let cachedHardwareInfo: any = null;
 
