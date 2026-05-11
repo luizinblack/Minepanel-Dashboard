@@ -1,0 +1,26 @@
+[
+  {
+    "id": "free_tier",
+    "name": "Free Tier",
+    "storageLimit": 1,
+    "bandwidthLimit": 5,
+    "maxConcurrentUploads": 1,
+    "concurrentUploadLimit": 1
+  },
+  {
+    "id": "pro_tier",
+    "name": "Pro Tier",
+    "storageLimit": 50,
+    "bandwidthLimit": 200,
+    "maxConcurrentUploads": 5,
+    "concurrentUploadLimit": 5
+  },
+  {
+    "id": "enterprise_tier",
+    "name": "Enterprise Tier",
+    "storageLimit": 1000,
+    "bandwidthLimit": 2000,
+    "maxConcurrentUploads": 20,
+    "concurrentUploadLimit": 20
+  }
+]

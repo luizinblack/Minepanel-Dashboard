@@ -25,7 +25,9 @@ import {
   Download,
   ScrollText,
   RotateCcw,
-  Search
+  Search,
+  Lock,
+  Layout
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'motion/react';
@@ -62,8 +64,39 @@ interface SystemStats {
     memoryUsed: number;
     memoryTotal: number;
   } | null;
+  network: {
+    tx: number;
+    rx: number;
+  };
+  throughput: number;
   uptime: number;
   timestamp: string;
+  saas?: {
+    activeTenants: number;
+    totalUploads: number;
+  };
+}
+
+interface SaaSData {
+  tenant: {
+    id: string;
+    name: string;
+    email: string;
+    planId: string;
+    apiKey: string;
+  };
+  plan: {
+    id: string;
+    name: string;
+    storageLimit: number;
+    bandwidthLimit: number;
+    maxConcurrentUploads: number;
+  };
+  usage: {
+    storageUsed: number;
+    bandwidthUsed: number;
+    uploadsCount: number;
+  };
 }
 
 type JobStatus =
@@ -111,6 +144,10 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [command, setCommand] = useState("");
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [saasData, setSaaSData] = useState<SaaSData | null>(null);
+  const [isLogged, setIsLogged] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginEmail, setLoginEmail] = useState("luizfelipebarbosa122@gmail.com");
   
   // Marketplace States
   const [marketQuery, setMarketQuery] = useState("");
@@ -167,6 +204,24 @@ export default function App() {
       console.warn("API status fetch failed (expected if server hasn't restarted yet)");
     }
 
+    const fetchSaaSData = async () => {
+      try {
+        const res = await fetch('/api/saas/me', {
+           headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setSaaSData(data);
+          setIsLogged(true);
+        }
+      } catch (e) {
+        console.error("Error fetching SaaS data:", e);
+      }
+    };
+
+    fetchSaaSData();
+    const saasInterval = setInterval(fetchSaaSData, 10000);
+
     socket.on('system_metrics', (newMetrics: SystemStats) => {
       setStats(newMetrics);
       setStatsHistory(prev => {
@@ -175,7 +230,8 @@ export default function App() {
         const next = [...prev, {
           time: new Date(newMetrics.timestamp).toLocaleTimeString(),
           cpu: cpuVal,
-          ram: ramVal
+          ram: ramVal,
+          network: (newMetrics.network.tx + newMetrics.network.rx) / 1024 / 1024
         }].slice(-30);
         return next;
       });
@@ -261,11 +317,13 @@ export default function App() {
     }, 10000);
 
     return () => {
-      socket.off('system_stats');
+      socket.off('system_metrics');
       socket.off('status_change');
       socket.off('console_log');
       socket.off('job_update');
+      socket.off('refresh_data');
       clearInterval(syncInterval);
+      clearInterval(saasInterval);
     };
   }, []);
 
@@ -756,13 +814,13 @@ export default function App() {
               Console do Servidor
             </button>
             <button 
-              onClick={() => setActiveTab('marketplace')}
+              onClick={() => setActiveTab('saas' as any)}
               className={cn(
                 "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
-                activeTab === 'marketplace' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+                activeTab === ('saas' as any) ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
               )}
             >
-              <Archive size={12} /> Marketplace
+              <Layout size={12} /> SaaS Portal
             </button>
           </div>
 
@@ -794,20 +852,20 @@ export default function App() {
                     percentage={stats?.ram.percent ?? 0}
                   />
                   <MetricCard 
-                    label="GPU" 
-                    value={stats?.gpu ? `${stats.gpu.usage}%` : "Inativa"} 
+                    label="Rede (TX/RX)" 
+                    value={`${((stats?.network.tx || 0) / 1024 / 1024).toFixed(1)} / ${((stats?.network.rx || 0) / 1024 / 1024).toFixed(1)} MB/s`} 
                     icon={<Activity className="text-[#bd00ff]" size={16} />}
-                    subLabel={stats?.gpu ? stats.gpu.name : "Monitorando..."}
+                    subLabel={`Tráfego em Tempo Real`}
                     color="#bd00ff"
-                    percentage={stats?.gpu?.usage ?? 0}
+                    percentage={Math.min(((stats?.network.tx || 0) + (stats?.network.rx || 0)) / 10000000 * 100, 100)}
                   />
                   <MetricCard 
-                    label="Uptime" 
-                    value={stats?.uptime ? (stats.uptime / 3600).toFixed(1) + "h" : "0.0h"} 
+                    label="Throughput SaaS" 
+                    value={`${((stats?.throughput || 0) / 1024 / 1024).toFixed(2)} MB/s`} 
                     icon={<RotateCcw className="text-amber-500" size={16} />}
-                    subLabel="Tempo Online"
+                    subLabel="Taxa de Upload Ativa"
                     color="#f59e0b"
-                    percentage={Math.min((stats?.uptime || 0) / 3600, 100)}
+                    percentage={Math.min((stats?.throughput || 0) / 50000000 * 100, 100)}
                   />
                 </div>
 
@@ -1050,6 +1108,122 @@ export default function App() {
                       Pressione ENTER para enviar
                     </div>
                   </div>
+              </motion.div>
+            ) : activeTab === ('saas' as any) ? (
+              <motion.div 
+                key="saas"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 1.05 }}
+                className="space-y-8"
+              >
+                {!isLogged ? (
+                   <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-12 text-center space-y-6">
+                      <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto">
+                        <Lock size={32} className="text-amber-500" />
+                      </div>
+                      <div className="space-y-2">
+                        <h2 className="text-2xl font-black italic uppercase tracking-tighter text-white">Portal do Tenant</h2>
+                        <p className="text-slate-500 max-w-md mx-auto">Acesso restrito ao painel administrativo do seu SaaS. Autentique-se para gerenciar planos e limites.</p>
+                      </div>
+                      <button 
+                        onClick={() => {
+                          fetch('/api/saas/auth/login', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ email: loginEmail })
+                          }).then(r => r.json()).then(data => {
+                             if (data.token) {
+                               localStorage.setItem('minecontrol_token', data.token);
+                               setIsLogged(true);
+                               window.location.reload();
+                             }
+                          });
+                        }}
+                        className="px-8 py-4 bg-[#38e11d] text-black font-black uppercase tracking-widest rounded-xl hover:scale-105 transition-transform"
+                      >
+                        Entrar com login seguro
+                      </button>
+                   </div>
+                ) : (
+                  <>
+                    {/* SaaS Overview Header */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                       <div className="bg-[#161616] p-8 border border-[#2d2d2d] rounded-2xl space-y-4">
+                          <span className="text-[10px] font-black uppercase text-slate-500 tracking-widest">Plano Ativo</span>
+                          <h3 className="text-3xl font-black italic text-[#38e11d] uppercase tracking-tighter">{saasData?.plan.name}</h3>
+                          <p className="text-xs text-slate-400">Próxima renovação: 11 de Junho, 2026</p>
+                       </div>
+                       <div className="md:col-span-2 bg-[#161616] p-8 border border-[#2d2d2d] rounded-2xl grid grid-cols-1 md:grid-cols-2 gap-8">
+                          <div className="space-y-3">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Armazenamento</span>
+                              <span className="text-xs font-mono text-white">
+                                {( (saasData?.usage.storageUsed || 0) / 1024 / 1024 / 1024 ).toFixed(2)} / {saasData?.plan.storageLimit} GB
+                              </span>
+                            </div>
+                            <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+                               <motion.div 
+                                 initial={{ width: 0 }}
+                                 animate={{ width: `${Math.min(((saasData?.usage.storageUsed || 0) / (saasData?.plan.storageLimit || 1) / 1024 / 1024 / 1024) * 100, 100)}%` }}
+                                 className="h-full bg-[#00d1ff] shadow-[0_0_15px_rgba(0,209,255,0.4)]"
+                               />
+                            </div>
+                          </div>
+                          <div className="space-y-3">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Bandwidth (Saída)</span>
+                              <span className="text-xs font-mono text-white">
+                                {( (saasData?.usage.bandwidthUsed || 0) / 1024 / 1024 / 1024 ).toFixed(2)} / {saasData?.plan.bandwidthLimit} GB
+                              </span>
+                            </div>
+                            <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+                               <motion.div 
+                                 initial={{ width: 0 }}
+                                 animate={{ width: `${Math.min(((saasData?.usage.bandwidthUsed || 0) / (saasData?.plan.bandwidthLimit || 1) / 1024 / 1024 / 1024) * 100, 100)}%` }}
+                                 className="h-full bg-[#bd00ff] shadow-[0_0_15px_rgba(189,0,255,0.4)]"
+                               />
+                            </div>
+                          </div>
+                       </div>
+                    </div>
+
+                    {/* Enterprise Management Section */}
+                    <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden">
+                       <div className="px-6 py-4 border-b border-[#2d2d2d] bg-[#1a1a1a] flex items-center justify-between">
+                          <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-white">Configurações do Tenant</h4>
+                          <span className="text-[8px] font-mono text-slate-500">ID: {saasData?.tenant.id}</span>
+                       </div>
+                       <div className="p-8 space-y-8">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
+                             <div className="space-y-4">
+                                <label className="text-[10px] font-bold uppercase text-slate-500 tracking-widest">API Key primária</label>
+                                <div className="flex gap-2">
+                                   <input 
+                                     type="password" 
+                                     value={saasData?.tenant.apiKey} 
+                                     readOnly 
+                                     className="flex-1 bg-black/40 border border-white/5 rounded-lg px-4 py-3 text-xs font-mono text-[#38e11d]" 
+                                   />
+                                   <button className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-bold uppercase text-white transition-colors">Copiar</button>
+                                </div>
+                                <p className="text-[9px] text-slate-500 italic">Use esta chave para integrar o sistema de upload via API externa.</p>
+                             </div>
+                             <div className="space-y-4">
+                                <label className="text-[10px] font-bold uppercase text-slate-500 tracking-widest">Regras de Concorrência</label>
+                                <div className="p-4 bg-white/5 rounded-xl border border-white/5">
+                                   <div className="flex items-center justify-between text-xs text-white font-black mb-2 italic uppercase">
+                                      <span>Uploads Simultâneos</span>
+                                      <span className="text-[#38e11d]">{saasData?.plan.maxConcurrentUploads}</span>
+                                   </div>
+                                   <p className="text-[10px] text-slate-500">Seu plano atual permite até {saasData?.plan.maxConcurrentUploads} uploads paralelos. Exceder este limite resultará em enfileiramento automático (SaaS Queue Control).</p>
+                                </div>
+                             </div>
+                          </div>
+                       </div>
+                    </div>
+                  </>
+                )}
               </motion.div>
             ) : activeTab === 'marketplace' ? (
               <motion.div 

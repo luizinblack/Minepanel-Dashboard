@@ -1,0 +1,10 @@
+[
+  {
+    "id": "tenant_001",
+    "name": "Default Tenant",
+    "email": "luizfelipebarbosa122@gmail.com",
+    "planId": "enterprise_tier",
+    "apiKey": "sk_minecontrol_dev_12345",
+    "createdAt": "2026-05-11T19:36:20Z"
+  }
+]

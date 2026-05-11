@@ -17,6 +17,9 @@ import * as dotenv from "dotenv";
 // Initialize environment variables
 dotenv.config();
 
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import { format } from "date-fns";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
@@ -67,6 +70,11 @@ const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks");
 const LOGS_DIR = path.join(__dirname, "logs");
 const LATEST_LOG_PATH = path.join(LOGS_DIR, "latest.log");
 const UPLOAD_METADATA_PATH = path.join(__dirname, "upload_metadata.json");
+const TENANTS_PATH = path.join(__dirname, "tenants.json");
+const PLANS_PATH = path.join(__dirname, "plans.json");
+const USAGE_PATH = path.join(__dirname, "usage.json");
+
+const JWT_SECRET = process.env.JWT_SECRET || "minecontrol_super_secret_2026";
 
 // Ensure directories exist
 const dirs = [
@@ -138,16 +146,21 @@ async function startServer() {
     },
   });
 
+  // Adaptive Rate Limiter State
+  let uploadThroughput = 0; // bytes/sec
+  let lastThroughputUpdate = Date.now();
+
   // System Monitoring
-  let lastMetrics = {};
+  let lastMetrics: any = {};
   const updateMetrics = async () => {
     try {
-      const [cpu, mem, load, gpu, temp] = await Promise.all([
+      const [cpu, mem, load, gpu, temp, net] = await Promise.all([
         si.currentLoad(),
         si.mem(),
         si.fullLoad(),
         si.graphics(),
-        si.cpuTemperature()
+        si.cpuTemperature(),
+        si.networkStats()
       ]);
 
       const metrics = {
@@ -169,12 +182,24 @@ async function startServer() {
           memoryUsed: gpu.controllers[0].memoryUsed || 0,
           memoryTotal: gpu.controllers[0].memoryTotal || 0,
         } : null,
+        network: {
+          tx: Math.round(net[0]?.tx_sec || 0),
+          rx: Math.round(net[0]?.rx_sec || 0),
+        },
+        throughput: uploadThroughput,
         uptime: os.uptime(),
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        saas: {
+          activeTenants: JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8')).length,
+          totalUploads: JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8')).length
+        }
       };
       
       lastMetrics = metrics;
       io.emit("system_metrics", metrics);
+      
+      // Decay throughput estimate
+      uploadThroughput = Math.max(0, uploadThroughput * 0.5);
     } catch (e) {
       console.error("Error updating metrics:", e);
     }
@@ -208,6 +233,51 @@ async function startServer() {
     });
     next();
   });
+
+  // Auth Middlewares & SaaS Guards
+  const authenticateToken = (req: any, res: any, next: any) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return next(); // For dev/preview convenience
+
+    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  };
+
+  const getUsage = (tenantId: string) => {
+    const usage = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf-8'));
+    return usage[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
+  };
+
+  const updateUsage = (tenantId: string, delta: any) => {
+    const usage = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf-8'));
+    const current = usage[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
+    usage[tenantId] = {
+      storageUsed: current.storageUsed + (delta.storage || 0),
+      bandwidthUsed: current.bandwidthUsed + (delta.bandwidth || 0),
+      uploadsCount: current.uploadsCount + (delta.uploads || 0)
+    };
+    fs.writeFileSync(USAGE_PATH, JSON.stringify(usage, null, 2));
+  };
+
+  const checkLimits = (req: any, res: any, next: any) => {
+    const tenantId = req.user?.tenantId || "tenant_001";
+    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
+    const plans = JSON.parse(fs.readFileSync(PLANS_PATH, 'utf-8'));
+    
+    const tenant = tenants.find((t: any) => t.id === tenantId);
+    const plan = plans.find((p: any) => p.id === tenant.planId);
+    const usage = getUsage(tenantId);
+
+    if (usage.storageUsed >= plan.storageLimit * 1024 * 1024 * 1024) {
+      return res.status(403).json({ error: "Limite de armazenamento atingido. Faça upgrade do seu plano." });
+    }
+    next();
+  };
 
   // Health Check
   app.get("/api/health", (req, res) => {
@@ -544,6 +614,15 @@ async function startServer() {
     fs.writeFileSync(UPLOAD_METADATA_PATH, JSON.stringify(currentMetadata, null, 2));
 
     auditLog("info", `Upload realizado: ${metadata.originalName}`, { metadata });
+    
+    // Update SaaS Usage
+    updateUsage(req.user?.tenantId || "tenant_001", { 
+      storage: metadata.size, 
+      bandwidth: metadata.size,
+      uploads: 1 
+    });
+    uploadThroughput += metadata.size;
+
     res.json(metadata);
   });
 
@@ -563,6 +642,30 @@ async function startServer() {
   app.get("/api/admin/uploads", (req, res) => {
     const metadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
     res.json(metadata);
+  });
+
+  // SaaS Portal Endpoints
+  app.get("/api/saas/me", authenticateToken, (req: any, res) => {
+    const tenantId = req.user?.tenantId || "tenant_001";
+    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
+    const plans = JSON.parse(fs.readFileSync(PLANS_PATH, 'utf-8'));
+    
+    const tenant = tenants.find((t: any) => t.id === tenantId);
+    const plan = plans.find((p: any) => p.id === tenant.planId);
+    const usage = getUsage(tenantId);
+
+    res.json({ tenant, plan, usage });
+  });
+
+  app.post("/api/saas/auth/login", (req, res) => {
+    const { email } = req.body;
+    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
+    const tenant = tenants.find((t: any) => t.email === email);
+
+    if (!tenant) return res.status(401).json({ error: "Tenant não encontrado" });
+
+    const token = jwt.sign({ tenantId: tenant.id, email: tenant.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, tenant });
   });
 
   // Chunked Upload System
@@ -641,6 +744,14 @@ async function startServer() {
         const currentMetadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
         currentMetadata.push(metadata);
         fs.writeFileSync(UPLOAD_METADATA_PATH, JSON.stringify(currentMetadata, null, 2));
+
+        // Update SaaS Usage
+        updateUsage(req.user?.tenantId || "tenant_001", { 
+          storage: metadata.size, 
+          bandwidth: metadata.size,
+          uploads: 1 
+        });
+        uploadThroughput += metadata.size;
 
         auditLog("info", `Chunked Upload Finalizado: ${metadata.originalName}`, { metadata });
         return res.json({ success: true, completed: true, metadata });
