@@ -63,12 +63,21 @@ const MODPACKS_CACHE_PATH = path.join(__dirname, "modpacks_cache.json");
 const PORT = 3000;
 const UPLOADS_DIR = path.join(__dirname, "server_files");
 const STANDARDIZED_UPLOADS_DIR = path.join(__dirname, "uploads");
+const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks");
 const LOGS_DIR = path.join(__dirname, "logs");
 const LATEST_LOG_PATH = path.join(LOGS_DIR, "latest.log");
 const UPLOAD_METADATA_PATH = path.join(__dirname, "upload_metadata.json");
 
 // Ensure directories exist
-const dirs = [UPLOADS_DIR, STANDARDIZED_UPLOADS_DIR, LOGS_DIR, path.join(STANDARDIZED_UPLOADS_DIR, "images"), path.join(STANDARDIZED_UPLOADS_DIR, "videos"), path.join(STANDARDIZED_UPLOADS_DIR, "documents")];
+const dirs = [
+  UPLOADS_DIR, 
+  STANDARDIZED_UPLOADS_DIR, 
+  CHUNKS_TEMP_DIR,
+  LOGS_DIR, 
+  path.join(STANDARDIZED_UPLOADS_DIR, "images"), 
+  path.join(STANDARDIZED_UPLOADS_DIR, "videos"), 
+  path.join(STANDARDIZED_UPLOADS_DIR, "documents")
+];
 dirs.forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
@@ -106,6 +115,9 @@ const upload = multer({ storage });
 async function startServer() {
   const app = express();
   
+  // Trust proxy for rate limiting (needed behind Nginx)
+  app.set('trust proxy', 1);
+  
   // Security & Performance Middlewares
   app.use(compression());
   app.use(express.json());
@@ -113,7 +125,8 @@ async function startServer() {
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 1000, // Limit each IP to 1000 requests per windowMs
-    message: { error: "Muitas requisições, tente novamente mais tarde." }
+    message: { error: "Muitas requisições, tente novamente mais tarde." },
+    validate: { trustProxy: false },
   });
   app.use("/api/", limiter);
 
@@ -551,6 +564,95 @@ async function startServer() {
     const metadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
     res.json(metadata);
   });
+
+  // Chunked Upload System
+  const getChunkDir = (fileId: string) => path.join(CHUNKS_TEMP_DIR, fileId);
+
+  app.get("/api/admin/upload/status", (req, res) => {
+    const { fileId } = req.query;
+    if (!fileId) return res.status(400).json({ error: "fileId is required" });
+
+    const chunkDir = getChunkDir(fileId as string);
+    if (!fs.existsSync(chunkDir)) {
+      return res.json({ uploadedChunks: [] });
+    }
+
+    const files = fs.readdirSync(chunkDir);
+    const uploadedChunks = files
+      .filter(f => f.startsWith('chunk-'))
+      .map(f => parseInt(f.replace('chunk-', ''), 10));
+
+    res.json({ uploadedChunks });
+  });
+
+  const chunkUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB per chunk
+  });
+
+  app.post("/api/admin/upload/chunk", chunkUpload.single("chunk"), async (req: any, res) => {
+    const { fileId, index, total, fileName } = req.body;
+    if (!req.file || !fileId || index === undefined || !total) {
+      return res.status(400).json({ error: "Missing required chunk data" });
+    }
+
+    const chunkDir = getChunkDir(fileId);
+    if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
+
+    const chunkPath = path.join(chunkDir, `chunk-${index}`);
+    fs.writeFileSync(chunkPath, req.file.buffer);
+
+    const files = fs.readdirSync(chunkDir);
+    const chunkCount = files.filter(f => f.startsWith('chunk-')).length;
+
+    if (chunkCount === parseInt(total, 10)) {
+      // All chunks received, initial merge
+      try {
+        const subDir = getSubDirForMime(req.body.mimeType || 'application/octet-stream');
+        const sanitizedName = fileName.replace(/[^a-zA-Z0-9.\-_ ()]/g, '_');
+        const ext = path.extname(sanitizedName);
+        const storedName = `${uuidv4()}${ext}`;
+        const finalPath = path.join(STANDARDIZED_UPLOADS_DIR, subDir, storedName);
+
+        const writeStream = fs.createWriteStream(finalPath);
+        
+        for (let i = 0; i < total; i++) {
+          const currentChunkPath = path.join(chunkDir, `chunk-${i}`);
+          const chunkBuffer = fs.readFileSync(currentChunkPath);
+          writeStream.write(chunkBuffer);
+          fs.unlinkSync(currentChunkPath); // Delete chunk after writing
+        }
+        
+        writeStream.end();
+
+        await finished(writeStream);
+        fs.rmdirSync(chunkDir); // Delete temp dir
+
+        const metadata = {
+          id: uuidv4(),
+          originalName: sanitizedName,
+          storedName: storedName,
+          size: fs.statSync(finalPath).size,
+          type: req.body.mimeType || 'application/octet-stream',
+          uploadedAt: new Date().toISOString(),
+          category: subDir
+        };
+
+        const currentMetadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
+        currentMetadata.push(metadata);
+        fs.writeFileSync(UPLOAD_METADATA_PATH, JSON.stringify(currentMetadata, null, 2));
+
+        auditLog("info", `Chunked Upload Finalizado: ${metadata.originalName}`, { metadata });
+        return res.json({ success: true, completed: true, metadata });
+      } catch (e: any) {
+        auditLog("error", "Error merging chunks", { error: e.message });
+        return res.status(500).json({ error: "Falha ao processar arquivo final" });
+      }
+    }
+
+    res.json({ success: true, completed: false });
+  });
+
   app.get("/api/status", (req, res) => {
     const script = findStartScript(UPLOADS_DIR);
     const hasScript = !!script;

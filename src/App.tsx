@@ -27,6 +27,7 @@ import {
   RotateCcw,
   Search
 } from 'lucide-react';
+import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   XAxis, 
@@ -95,13 +96,13 @@ export default function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<any[]>([]);
   const [jobs, setJobs] = useState<ServerJob[]>([]);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [status, setStatus] = useState<'stopped' | 'starting' | 'running' | 'stopping'>('stopped');
   const [hasScript, setHasScript] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [currentJar, setCurrentJar] = useState<string>("");
   const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [activeUploads, setActiveUploads] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace'>('monitor');
   const [currentPath, setCurrentPath] = useState<string>(".");
   const [fileList, setFileList] = useState<any[]>([]);
@@ -295,69 +296,81 @@ export default function App() {
     }
   };
 
-  const uploadChunked = async (file: File, relativePath: string = "") => {
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+  const uploadChunked = async (file: File, options: any = {}) => {
+    const { 
+      onProgress = () => {}, 
+      fileId = `${file.name}-${file.size}-${file.lastModified}`,
+      MAX_CONCURRENT = 2,
+      CHUNK_SIZE = 2 * 1024 * 1024 // 2MB
+    } = options;
+
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const filename = file.name;
-    const PARALLEL_UPLOADS = 3;
-    let uploadedChunks = 0;
+    
+    // 1. Check status (Resume support)
+    const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`);
+    const { uploadedChunks } = await statusRes.json();
+    
+    const remainingChunks = [];
+    for (let i = 0; i < totalChunks; i++) {
+       if (!uploadedChunks.includes(i)) remainingChunks.push(i);
+    }
 
-    // Helper to upload a single chunk
-    const uploadChunk = async (i: number) => {
-      if (i >= totalChunks) return;
+    if (remainingChunks.length === 0) {
+       onProgress(100);
+       return;
+    }
 
-      let success = false;
-      let retries = 3;
+    // 2. Upload queue with concurrency control
+    let finishedChunks = totalChunks - remainingChunks.length;
+    
+    const uploadWithRetry = async (index: number, attempt = 1): Promise<void> => {
+      try {
+        const start = index * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const chunk = file.slice(start, end);
 
-      while (!success && retries > 0) {
-        try {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(file.size, start + CHUNK_SIZE);
-          const chunk = file.slice(start, end);
+        const formData = new FormData();
+        formData.append('chunk', chunk);
+        formData.append('fileId', fileId);
+        formData.append('index', index.toString());
+        formData.append('total', totalChunks.toString());
+        formData.append('fileName', file.name);
+        formData.append('mimeType', file.type);
 
-          const formData = new FormData();
-          formData.append('chunk', chunk);
-          formData.append('filename', filename);
-          formData.append('chunkIndex', i.toString());
-          formData.append('totalChunks', totalChunks.toString());
-          formData.append('relPath', relativePath); // Send the directory path
+        const res = await fetch('/api/admin/upload/chunk', {
+          method: 'POST',
+          body: formData,
+        });
 
-          const res = await fetch('/api/upload/chunk', {
-            method: 'POST',
-            body: formData,
-          });
-
-          if (!res.ok) throw new Error(`Status ${res.status}`);
-          success = true;
-        } catch (err) {
-          retries--;
-          if (retries === 0) throw err;
-          await new Promise(r => setTimeout(r, 1000));
+        if (!res.ok) {
+           if (res.status === 429) throw new Error("Rate limit exceeded");
+           throw new Error(`Upload failed: ${res.status}`);
         }
+        
+        finishedChunks++;
+        onProgress(Math.round((finishedChunks / totalChunks) * 100));
+      } catch (err: any) {
+        if (attempt >= 5) throw err;
+        const delay = 1000 * Math.pow(2, attempt); // Exponential backoff
+        await new Promise(r => setTimeout(r, delay));
+        return uploadWithRetry(index, attempt + 1);
       }
-      
-      uploadedChunks++;
-      // We don't update global progress here if we are doing multiple files
-      // but we could if we wanted to.
-      await uploadChunk(i + PARALLEL_UPLOADS);
     };
 
-    const pool = [];
-    for (let i = 0; i < Math.min(PARALLEL_UPLOADS, totalChunks); i++) {
-      pool.push(uploadChunk(i));
+    const queue = [...remainingChunks];
+    const workers = [];
+    
+    for (let i = 0; i < Math.min(MAX_CONCURRENT, queue.length); i++) {
+      const worker = async () => {
+        while (queue.length > 0) {
+          const index = queue.shift()!;
+          await uploadWithRetry(index);
+        }
+      };
+      workers.push(worker());
     }
-    await Promise.all(pool);
 
-    const finalizeRes = await fetch('/api/upload/finalize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename, totalChunks, relPath: relativePath }),
-    });
-
-    if (!finalizeRes.ok) {
-      const data = await finalizeRes.json();
-      throw new Error(data.error || "Erro ao finalizar upload");
-    }
+    await Promise.all(workers);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -365,17 +378,25 @@ export default function App() {
     if (!file) return;
 
     setIsUploading(true);
-    setUploadProgress(0);
+    const newUpload = { id: uuidv4(), name: file.name, progress: 0, status: 'uploading' };
+    setActiveUploads(prev => [...prev, newUpload]);
 
     try {
-      await uploadChunked(file);
-      setUploadProgress(100);
+      await uploadChunked(file, {
+        onProgress: (p: number) => {
+          setActiveUploads(prev => prev.map(u => u.id === newUpload.id ? { ...u, progress: p } : u));
+        }
+      });
+      setActiveUploads(prev => prev.map(u => u.id === newUpload.id ? { ...u, progress: 100, status: 'done' } : u));
+      setTimeout(() => {
+        setActiveUploads(prev => prev.filter(u => u.id !== newUpload.id));
+      }, 5000);
+      fetch('/api/admin/uploads').then(res => res.json()).then(setAuditLogs);
     } catch (err: any) {
       console.error(err);
-      alert("Falha no upload: " + err.message);
+      setActiveUploads(prev => prev.map(u => u.id === newUpload.id ? { ...u, status: 'error', error: err.message } : u));
     } finally {
       setIsUploading(false);
-      setUploadProgress(0);
       if (e.target) e.target.value = '';
     }
   };
@@ -385,32 +406,30 @@ export default function App() {
     if (!files || files.length === 0) return;
 
     setIsUploading(true);
-    setUploadProgress(0);
-
     const totalFiles = files.length;
     let processedCount = 0;
 
+    const folderUploadId = uuidv4();
+    const newUpload = { id: folderUploadId, name: `Pasta: ${files[0].webkitRelativePath.split('/')[0]}`, progress: 0, status: 'uploading', count: `0/${totalFiles}` };
+    setActiveUploads(prev => [...prev, newUpload]);
+
     try {
-      // For folder uploads, we process files one by one to keep it stable, 
-      // but each file gets chunked if large.
       for (let i = 0; i < totalFiles; i++) {
         const file = files[i];
-        const fullPath = (file as any).webkitRelativePath || file.name;
-        const relativeDir = fullPath.includes('/') ? fullPath.substring(0, fullPath.lastIndexOf('/')) : '';
-        
-        await uploadChunked(file, relativeDir);
-        
+        await uploadChunked(file);
         processedCount++;
-        setUploadProgress(Math.round((processedCount / totalFiles) * 100));
+        const p = Math.round((processedCount / totalFiles) * 100);
+        setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: p, count: `${processedCount}/${totalFiles}` } : u));
       }
-
-      alert(`PASTA ENVIADA: ${processedCount}/${totalFiles} arquivos processados.`);
+      setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: 100, status: 'done' } : u));
+      setTimeout(() => {
+        setActiveUploads(prev => prev.filter(u => u.id !== folderUploadId));
+      }, 5000);
     } catch (err: any) {
       console.error(err);
-      alert("Erro fatal no upload da pasta: " + err.message);
+      setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, status: 'error', error: err.message } : u));
     } finally {
       setIsUploading(false);
-      setUploadProgress(0);
       if (e.target) e.target.value = '';
     }
   };
@@ -1540,10 +1559,10 @@ export default function App() {
                       <Upload size={24} className={isUploading ? "text-[#38e11d]" : "text-white/40"} />
                     </div>
                     <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
-                      {isUploading ? "SUBINDO..." : "ARQUIVO"}
+                      ARQUIVO
                     </h4>
                     <p className="text-[10px] text-slate-500 text-center px-4">
-                      {isUploading ? `Progresso: ${uploadProgress}%` : ".zip ou arquivos grandes"}
+                      .zip, .jar ou arquivos grandes
                     </p>
                  </label>
 
@@ -1567,25 +1586,15 @@ export default function App() {
                       <Folder size={24} className={isUploading ? "text-[#00d1ff]" : "text-white/40"} />
                     </div>
                     <h4 className="font-bold mb-1 text-white uppercase tracking-tight">
-                      {isUploading ? "SUBINDO..." : "PASTA"}
+                      PASTA
                     </h4>
                     <p className="text-[10px] text-slate-500 text-center px-4">
-                      {isUploading ? `Progresso: ${uploadProgress}%` : "Mande a pasta inteira"}
+                      Mande a pasta inteira
                     </p>
                  </label>
                 </div>
 
-                {isUploading && (
-                  <div className="w-full mt-4 bg-white/5 h-1.5 rounded-full overflow-hidden border border-white/5">
-                    <motion.div 
-                      initial={{ width: 0 }}
-                      animate={{ width: `${uploadProgress}%` }}
-                      className="h-full bg-[#38e11d] shadow-[0_0_10px_rgba(56,225,29,0.3)]"
-                    />
-                  </div>
-                )}
-
-               <div className="mt-8 space-y-4">
+                <div className="mt-8 space-y-4">
                   <span className="text-[10px] uppercase font-bold text-slate-500 tracking-[0.2em]">Executável Selecionado</span>
                   
                   <div className="p-4 bg-black/50 rounded-xl border border-[#2d2d2d]">
@@ -1638,6 +1647,60 @@ export default function App() {
              </p>
           </div>
         </div>
+
+        {/* Upload Queue Panel */}
+        <AnimatePresence>
+          {activeUploads.length > 0 && (
+            <motion.div 
+              initial={{ opacity: 0, y: 50, scale: 0.9 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 50, scale: 0.9 }}
+              className="fixed bottom-8 right-8 z-[100] w-80 bg-[#161616] border border-[#2d2d2d] rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden"
+            >
+              <div className="bg-[#1a1a1a] px-4 py-3 border-b border-[#2d2d2d] flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-[#38e11d] rounded-full animate-pulse" />
+                  <span className="text-[10px] font-black uppercase tracking-widest text-white">Upload Manager</span>
+                </div>
+                <span className="text-[10px] font-mono text-slate-500">{activeUploads.filter(u => u.status === 'uploading').length} Ativos</span>
+              </div>
+              <div className="max-h-[300px] overflow-y-auto custom-scrollbar p-3 space-y-2">
+                {activeUploads.map(upload => (
+                  <div key={upload.id} className="p-3 bg-black/20 rounded-xl border border-white/5 space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[10px] font-bold text-white truncate max-w-[180px]">{upload.name}</span>
+                      <span className={cn(
+                        "text-[9px] font-mono",
+                        upload.status === 'error' ? "text-red-500" : "text-[#38e11d]"
+                      )}>
+                        {upload.status === 'error' ? 'Erro' : `${upload.progress}%`}
+                      </span>
+                    </div>
+                    <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${upload.progress}%` }}
+                        className={cn(
+                          "h-full transition-all duration-300",
+                          upload.status === 'error' ? "bg-red-500" : "bg-[#38e11d]"
+                        )}
+                      />
+                    </div>
+                    {upload.count && (
+                      <p className="text-[8px] text-slate-500 font-mono uppercase tracking-tight flex items-center justify-between">
+                        <span>Progresso da Pasta</span>
+                        <span>{upload.count} arquivos</span>
+                      </p>
+                    )}
+                    {upload.error && (
+                      <p className="text-[8px] text-red-500 font-normal line-clamp-1 italic">{upload.error}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
 
       <style>{`
