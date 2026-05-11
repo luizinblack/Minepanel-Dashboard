@@ -132,8 +132,10 @@ async function startServer() {
   
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 50000, // Increased as requested
+    max: 1000, // Balanced for UI interactions
     message: { error: "Muitas requisições, tente novamente mais tarde." },
+    standardHeaders: true,
+    legacyHeaders: false,
     validate: { trustProxy: false },
     skip: (req) => req.path.startsWith("/api/admin/upload")
   });
@@ -142,16 +144,16 @@ async function startServer() {
     windowMs: 15 * 60 * 1000,
     max: 100000, // 100k requests for high-volume uploads
     message: { error: "Limite de upload atingido." },
+    standardHeaders: true,
+    legacyHeaders: false,
     validate: { trustProxy: false },
   });
 
-  // Apply general limiter to all API routes except upload
-  app.use("/api/", limiter);
-
-  // Apply permissive limiter to upload routes
+  // Apply permissive limiter to upload routes FIRST
   app.use("/api/admin/upload", uploadLimiter);
-  app.use("/api/admin/upload/status", uploadLimiter);
-  app.use("/api/admin/upload/chunk", uploadLimiter);
+
+  // Apply general limiter to all other API routes
+  app.use("/api/", limiter);
 
   const httpServer = createServer(app);
   const io = new Server(httpServer, {

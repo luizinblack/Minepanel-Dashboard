@@ -47,7 +47,7 @@ import { cn } from './lib/utils';
 const socket = io();
 
 // Limite global compartilhado entre TODOS os arquivos
-const globalUploadLimit = pLimit(3);
+const globalUploadLimit = pLimit(1);
 
 interface SystemStats {
   cpu: {
