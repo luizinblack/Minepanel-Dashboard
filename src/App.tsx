@@ -51,9 +51,32 @@ interface SystemStats {
   timestamp: string;
 }
 
+type JobStatus =
+  | "UPLOADING"
+  | "UPLOADED"
+  | "VALIDATING"
+  | "QUEUED"
+  | "EXTRACTING"
+  | "STARTING"
+  | "DONE"
+  | "FAILED";
+
+interface ServerJob {
+  id: string;
+  filename: string;
+  filePath: string;
+  outputPath: string;
+  status: JobStatus;
+  hash?: string;
+  createdAt: number;
+  error?: string;
+  progress?: number;
+}
+
 export default function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<any[]>([]);
+  const [jobs, setJobs] = useState<ServerJob[]>([]);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [status, setStatus] = useState<'stopped' | 'starting' | 'running' | 'stopping'>('stopped');
   const [hasScript, setHasScript] = useState<boolean>(false);
@@ -126,10 +149,63 @@ export default function App() {
       setLogs(prev => [...prev, log].slice(-200));
     });
 
+    socket.on('job_update', (updatedJob: ServerJob) => {
+      setJobs(prev => {
+        const index = prev.findIndex(j => j.id === updatedJob.id);
+        if (index !== -1) {
+          const next = [...prev];
+          next[index] = updatedJob;
+          return next;
+        }
+        return [...prev, updatedJob].slice(-10);
+      });
+      
+      // Auto-refresh file list and jar if a job finishes
+      if (updatedJob.status === 'DONE') {
+        fetch('/api/status')
+          .then(res => res.json())
+          .then(data => {
+            setCurrentJar(data.jar);
+            setAvailableJars(data.availableJars);
+          });
+          
+        // Use timeout to allow filesystem to "settle"
+        setTimeout(() => fetchFiles(currentPath), 500);
+      }
+    });
+
+    // Initial data fetch
+    const fetchInitialData = async () => {
+      try {
+        const [statusRes, jobsRes] = await Promise.all([
+          fetch('/api/status'),
+          fetch('/api/jobs')
+        ]);
+        
+        if (statusRes.ok) {
+          const statusData = await statusRes.json();
+          setStatus(statusData.status);
+          setCurrentJar(statusData.jar);
+          setAvailableJars(statusData.availableJars);
+          setHasScript(statusData.hasScript);
+        }
+        
+        if (jobsRes.ok) {
+          const jobsData = await jobsRes.json();
+          setJobs(jobsData);
+        }
+      } catch (e) {
+        console.warn("Initial data fetch failed");
+      }
+    };
+
+    fetchInitialData();
+
     return () => {
       socket.off('system_stats');
       socket.off('status_change');
       socket.off('console_log');
+      socket.off('job_update');
     };
   }, []);
 
@@ -289,7 +365,6 @@ export default function App() {
       }
     },
     extract: async (file: any) => {
-      if (!confirm(`Deseja extrair os arquivos de ${file.name}? O arquivo ZIP será excluído após a extração.`)) return;
       try {
         setIsUploading(true);
         const res = await fetch('/api/files/extract', {
@@ -298,11 +373,8 @@ export default function App() {
           body: JSON.stringify({ filename: file.name, currentPath }),
         });
         const data = await res.json();
-        if (res.ok) {
-          alert(data.message);
-          fetchFiles(currentPath);
-        } else {
-          alert("Erro na extração: " + data.error);
+        if (!res.ok) {
+          alert("Erro ao adicionar na fila: " + data.error);
         }
       } catch (err) {
         console.error(err);
@@ -723,8 +795,22 @@ export default function App() {
           
           {/* File Management */}
           <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-6 shadow-xl flex flex-col min-h-[460px]">
-            <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 mb-6">Configuração Local</h3>
+            <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 mb-6">Controle de Tarefas</h3>
             
+            {/* Jobs Queue UI */}
+            <div className="space-y-3 mb-6">
+              {jobs.filter(j => j.status !== 'DONE' && j.status !== 'FAILED').length > 0 ? (
+                jobs.filter(j => j.status !== 'DONE' && j.status !== 'FAILED').map(job => (
+                  <JobCard key={job.id} job={job} />
+                ))
+              ) : (
+                <div className="py-8 border border-dashed border-[#2d2d2d] rounded-xl flex flex-col items-center justify-center">
+                  <PackageOpen size={24} className="text-slate-700 mb-2" />
+                  <p className="text-[10px] uppercase font-bold text-slate-600 tracking-widest">Nenhuma tarefa ativa</p>
+                </div>
+              )}
+            </div>
+
             <div className="flex-1 flex flex-col">
                <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 mb-4">
                  <div className="flex gap-3">
@@ -889,6 +975,69 @@ function MetricCard({ label, value, icon, subLabel, color, percentage, className
       {/* Decorative background icon */}
       <div className="absolute -bottom-4 -right-4 opacity-5 group-hover:opacity-10 transition-opacity">
          {React.cloneElement(icon as React.ReactElement, { size: 80 })}
+      </div>
+    </div>
+  );
+}
+
+function JobCard({ job }: { job: ServerJob }) {
+  const statusColors = {
+    UPLOADING: "text-blue-400",
+    UPLOADED: "text-blue-500",
+    VALIDATING: "text-amber-500",
+    QUEUED: "text-slate-500",
+    EXTRACTING: "text-[#38e11d]",
+    STARTING: "text-indigo-400",
+    DONE: "text-[#38e11d]",
+    FAILED: "text-red-500"
+  };
+
+  const statusLabels = {
+    UPLOADING: "Enviando...",
+    UPLOADED: "Enviado",
+    VALIDATING: "Validando Hash...",
+    QUEUED: "Na fila",
+    EXTRACTING: "Extraindo...",
+    STARTING: "Iniciando...",
+    DONE: "Concluído",
+    FAILED: "Falha"
+  };
+
+  return (
+    <div className="p-4 bg-black/40 border border-[#2d2d2d] rounded-xl flex items-center gap-4 group hover:border-white/10 transition-all">
+      <div className={cn(
+        "w-10 h-10 rounded-lg flex items-center justify-center shrink-0",
+        job.status === 'FAILED' ? "bg-red-500/10" : "bg-white/5"
+      )}>
+        {job.status === 'EXTRACTING' ? <PackageOpen className="text-[#38e11d] animate-bounce" size={18} /> : 
+         job.status === 'VALIDATING' ? <Activity className="text-amber-500 animate-pulse" size={18} /> :
+         job.status === 'FAILED' ? <X className="text-red-500" size={18} /> :
+         <Archive className="text-slate-400" size={18} />}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex justify-between items-center mb-1">
+          <p className="text-xs font-bold text-white truncate uppercase tracking-tight">{job.filename}</p>
+          <span className={cn("text-[9px] font-black uppercase tracking-widest", statusColors[job.status])}>
+            {statusLabels[job.status]}
+          </span>
+        </div>
+        <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
+          {(job.status === 'EXTRACTING' || job.status === 'UPLOADING') ? (
+            <motion.div 
+              initial={{ x: "-100%" }}
+              animate={{ x: "0%" }}
+              transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+              className="h-full bg-[#38e11d]"
+            />
+          ) : job.status === 'DONE' ? (
+            <div className="w-full h-full bg-[#38e11d]" />
+          ) : job.status === 'FAILED' ? (
+            <div className="w-full h-full bg-red-500" />
+          ) : (
+             <div className="w-0 h-full bg-slate-500" />
+          )}
+        </div>
+        {job.error && <p className="text-[9px] text-red-500/70 mt-1 truncate">{job.error}</p>}
       </div>
     </div>
   );

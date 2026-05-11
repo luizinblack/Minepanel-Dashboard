@@ -10,6 +10,30 @@ import { spawn, ChildProcess } from "child_process";
 import multer from "multer";
 import fs from "fs";
 import unzipper from "unzipper";
+import crypto from "crypto";
+import { finished } from "stream/promises";
+
+type JobStatus =
+  | "UPLOADING"
+  | "UPLOADED"
+  | "VALIDATING"
+  | "QUEUED"
+  | "EXTRACTING"
+  | "STARTING"
+  | "DONE"
+  | "FAILED";
+
+interface ServerJob {
+  id: string;
+  filename: string;
+  filePath: string;
+  outputPath: string;
+  status: JobStatus;
+  hash?: string;
+  createdAt: number;
+  error?: string;
+  progress?: number;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,6 +70,72 @@ async function startServer() {
   let minecraftProcess: ChildProcess | null = null;
   let serverStatus = "stopped"; // stopped, starting, running, stopping
   let serverJarName = "";
+
+  // Jobs System
+  const jobs: ServerJob[] = [];
+  let isProcessingQueue = false;
+
+  const getFileHash = async (filePath: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash("sha256");
+      const stream = fs.createReadStream(filePath);
+      stream.on("data", (data) => hash.update(data));
+      stream.on("end", () => resolve(hash.digest("hex")));
+      stream.on("error", reject);
+    });
+  };
+
+  const updateJob = (jobId: string, updates: Partial<ServerJob>) => {
+    const jobIndex = jobs.findIndex(j => j.id === jobId);
+    if (jobIndex !== -1) {
+      jobs[jobIndex] = { ...jobs[jobIndex], ...updates };
+      io.emit("job_update", jobs[jobIndex]);
+    }
+  };
+
+  const processQueue = async () => {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+
+    while (true) {
+      const job = jobs.find(j => j.status === "QUEUED");
+      if (!job) break;
+
+      console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
+      try {
+        updateJob(job.id, { status: "EXTRACTING" });
+        io.emit("console_log", `[MineControl] Worker: Extraindo ${job.filename}...`);
+
+        if (job.filename.endsWith('.zip')) {
+          await fs.createReadStream(job.filePath)
+            .pipe(unzipper.Extract({ path: job.outputPath }))
+            .promise();
+          
+          // Cleanup ZIP after extraction if requested (manual extract removes it)
+          if (job.id.startsWith('manual-')) {
+            try { fs.unlinkSync(job.filePath); } catch(e) {}
+          }
+        }
+
+        updateJob(job.id, { status: "DONE" });
+        io.emit("console_log", `[MineControl] Worker: Job ${job.id} finalizado.`);
+
+        // Refresh JAR detection
+        const filesAfter = fs.readdirSync(UPLOADS_DIR);
+        const jarFile = filesAfter.find(f => f.endsWith('.jar'));
+        if (jarFile && !serverJarName) {
+            serverJarName = jarFile;
+            io.emit("status_change", { status: serverStatus, jar: serverJarName });
+        }
+      } catch (err: any) {
+        console.error(`[WORKER ERROR] Job ${job.id}:`, err);
+        updateJob(job.id, { status: "FAILED", error: err.message });
+        io.emit("console_log", `[MineControl] Worker: Falha no Job ${job.id} - ${err.message}`);
+      }
+    }
+
+    isProcessingQueue = false;
+  };
 
   // Set default jar if exists
   const files = fs.readdirSync(UPLOADS_DIR);
@@ -173,79 +263,22 @@ async function startServer() {
     res.json({ success: true, message: `Chunk ${chunkIndex}/${totalChunks} saved` });
   });
 
-  // Detecção de estabilidade real do arquivo no disco
-  const waitForStableFile = (filePath: string): Promise<void> => {
-    return new Promise((resolve) => {
-      let lastSize = -1;
-      let stableCount = 0;
-
-      const check = () => {
-        try {
-          if (!fs.existsSync(filePath)) {
-            setTimeout(check, 300);
-            return;
-          }
-          const stats = fs.statSync(filePath);
-          const size = stats.size;
-
-          if (size > 0 && size === lastSize) {
-            stableCount++;
-          } else {
-            stableCount = 0;
-            lastSize = size;
-          }
-
-          // arquivo considerado finalizado após estabilidade contínua (3 verificações de 300ms)
-          if (stableCount >= 3) {
-            return resolve();
-          }
-
-          setTimeout(check, 300);
-        } catch {
-          setTimeout(check, 300);
-        }
-      };
-
-      check();
-    });
-  };
-
-  // Helper para extração ZIP segura e assíncrona
-  const extractZipSafe = async (filePath: string, outputPath: string, logLabel: string) => {
-    console.log(`[ZIP] ${logLabel}: Aguardando estabilidade do arquivo...`);
-    await waitForStableFile(filePath);
-
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Arquivo ZIP não encontrado: ${filePath}`);
-    }
-
-    // Validação de integridade: verificar tamanho do arquivo
-    const stats = fs.statSync(filePath);
-    if (stats.size === 0) {
-      throw new Error(`Arquivo ZIP corrompido ou vazio (0 bytes).`);
-    }
-
-    console.log(`[ZIP] ${logLabel}: Arquivo estável confirmado (${stats.size} bytes). Iniciando extração...`);
-    io.emit("console_log", `[MineControl] ${logLabel}: Extraindo arquivos (${(stats.size/1024/1024).toFixed(2)} MB)...`);
-    
-    try {
-      // Extração via stream com unzipper.promise() para garantir conclusão
-      await fs.createReadStream(filePath)
-        .pipe(unzipper.Extract({ path: outputPath }))
-        .promise();
-      
-      console.log(`[ZIP] ${logLabel}: Extração finalizada com sucesso.`);
-      io.emit("console_log", `[MineControl] ${logLabel}: Extração concluída.`);
-    } catch (err: any) {
-      console.error(`[ZIP] ${logLabel}: Erro durante extração: ${err.message}`);
-      throw err;
-    }
-  };
-
   app.post("/api/upload/finalize", express.json(), async (req, res) => {
     const { filename, totalChunks } = req.body;
     const finalPath = path.join(UPLOADS_DIR, filename);
     const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
+
+    const jobId = `upload-${Date.now()}`;
+    const newJob: ServerJob = {
+      id: jobId,
+      filename,
+      filePath: finalPath,
+      outputPath: UPLOADS_DIR,
+      status: "UPLOADING",
+      createdAt: Date.now()
+    };
+    jobs.push(newJob);
+    io.emit("job_update", newJob);
 
     try {
       const writeStream = fs.createWriteStream(finalPath);
@@ -261,30 +294,23 @@ async function startServer() {
       
       writeStream.end();
 
-      writeStream.on('finish', async () => {
-        try {
-          fs.rmSync(chunkDir, { recursive: true, force: true });
+      await finished(writeStream);
+      
+      console.log(`[UPLOAD] Finalizado: ${filename}. Validando integridade...`);
+      updateJob(jobId, { status: "VALIDATING" });
+      
+      const hash = await getFileHash(finalPath);
+      console.log(`[UPLOAD] SHA256: ${hash}`);
+      
+      fs.rmSync(chunkDir, { recursive: true, force: true });
+      
+      updateJob(jobId, { status: "QUEUED", hash });
+      processQueue(); // Start worker if not running
 
-          if (filename.endsWith('.zip')) {
-            await extractZipSafe(finalPath, UPLOADS_DIR, "Upload Chunk");
-            
-            const filesAfter = fs.readdirSync(UPLOADS_DIR);
-            const jarFile = filesAfter.find(f => f.endsWith('.jar'));
-            if (jarFile && !serverJarName) serverJarName = jarFile;
+      res.json({ message: "Upload finalizado e enviado para fila de processamento.", jobId, hash });
 
-            res.json({ message: "Backup enviado e extraído com sucesso!", filename, extracted: true, detectedJar: jarFile });
-          } else {
-            res.json({ message: "Arquivo enviado e reconstruído com sucesso!", filename });
-          }
-        } catch (extractErr: any) {
-          res.status(500).json({ error: "Erro na extração pós-upload: " + extractErr.message });
-        }
-      });
-
-      writeStream.on('error', (err) => {
-        res.status(500).json({ error: "Erro ao gravar arquivo final: " + err.message });
-      });
     } catch (err: any) {
+      updateJob(jobId, { status: "FAILED", error: err.message });
       res.status(500).json({ error: "Erro ao finalizar upload: " + err.message });
     }
   });
@@ -295,33 +321,37 @@ async function startServer() {
     }
 
     const { originalname, path: filePath } = req.file;
+    const jobId = `direct-${Date.now()}`;
+
+    const newJob: ServerJob = {
+      id: jobId,
+      filename: originalname,
+      filePath: filePath,
+      outputPath: UPLOADS_DIR,
+      status: "UPLOADED",
+      createdAt: Date.now()
+    };
+    jobs.push(newJob);
+    io.emit("job_update", newJob);
 
     try {
-      if (originalname.endsWith('.zip')) {
-        await extractZipSafe(filePath, UPLOADS_DIR, "Upload Simples");
-        
-        const filesAfter = fs.readdirSync(UPLOADS_DIR);
-        const jarFile = filesAfter.find(f => f.endsWith('.jar'));
-        if (jarFile && !serverJarName) serverJarName = jarFile;
-
-        return res.json({ 
-          message: "Servidor extraído e salvo com sucesso!", 
-          filename: originalname,
-          extracted: true,
-          detectedJar: jarFile
-        });
-      }
-
-      if (originalname.endsWith('.jar')) {
+      updateJob(jobId, { status: "VALIDATING" });
+      const hash = await getFileHash(filePath);
+      
+      if (originalname.endsWith('.jar') && !serverJarName) {
         serverJarName = originalname;
       }
 
+      updateJob(jobId, { status: "QUEUED", hash });
+      processQueue();
+
       return res.json({ 
-        message: "Arquivo carregado com sucesso!", 
-        filename: originalname 
+        message: "Arquivo recebido e enviado para processamento.", 
+        jobId,
+        hash
       });
     } catch (err: any) {
-      console.error("Upload error:", err);
+      updateJob(jobId, { status: "FAILED", error: err.message });
       return res.status(500).json({ error: "Erro ao processar o arquivo: " + err.message });
     }
   });
@@ -364,21 +394,21 @@ async function startServer() {
     }
 
     const extractDir = path.dirname(filePath);
-    
-    try {
-      await extractZipSafe(filePath, extractDir, "Extração Manual");
-      
-      try {
-        fs.unlinkSync(filePath); // Exclui o ZIP após extrair conforme solicitado
-        io.emit("console_log", `[MineControl] Arquivo original ${filename} removido após extração.`);
-      } catch (e: any) {
-        console.warn(`[ZIP] Falha ao remover ZIP original: ${e.message}`);
-      }
+    const jobId = `manual-${Date.now()}`;
 
-      res.json({ message: "Extraído com sucesso!" });
-    } catch (err: any) {
-      res.status(500).json({ error: "Erro na extração: " + err.message });
-    }
+    const newJob: ServerJob = {
+      id: jobId,
+      filename,
+      filePath,
+      outputPath: extractDir,
+      status: "QUEUED",
+      createdAt: Date.now()
+    };
+    jobs.push(newJob);
+    io.emit("job_update", newJob);
+    processQueue();
+
+    res.json({ message: "Extração adicionada à fila.", jobId });
   });
 
   app.get("/api/file/read", (req, res) => {
@@ -466,6 +496,10 @@ async function startServer() {
 
     minecraftProcess.stdin?.write(command + "\n");
     res.json({ success: true });
+  });
+
+  app.get("/api/jobs", (req, res) => {
+    res.json(jobs.slice(-10)); // return last 10 jobs
   });
 
   // Socket.io stats broadcasting
