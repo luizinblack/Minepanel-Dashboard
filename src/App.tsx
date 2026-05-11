@@ -139,9 +139,15 @@ export default function App() {
   const [currentJar, setCurrentJar] = useState<string>("");
   const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const isUploadingRef = useRef(isUploading);
+  useEffect(() => { isUploadingRef.current = isUploading; }, [isUploading]);
+
   const [activeUploads, setActiveUploads] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace' | 'saas'>('monitor');
   const [currentPath, setCurrentPath] = useState<string>(".");
+  const currentPathRef = useRef(currentPath);
+  useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
+
   const [fileList, setFileList] = useState<any[]>([]);
   const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
   const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
@@ -196,7 +202,7 @@ export default function App() {
   useEffect(() => {
     // Initial status fetch + jobs + audit logs (Centralized)
     const fetchInitialData = async () => {
-      if (isUploading) return;
+      if (isUploadingRef.current) return;
       try {
         const token = localStorage.getItem('minecontrol_token');
         const authHeader = (token && token !== "null") ? { 'Authorization': `Bearer ${token}` } : {};
@@ -274,9 +280,15 @@ export default function App() {
       });
     });
 
+    const lastRefreshRef = { current: 0 };
     socket.on('refresh_data', () => {
+      if (isUploadingRef.current) return;
+      const now = Date.now();
+      if (now - lastRefreshRef.current < 5000) return; // 5s throttle
+      lastRefreshRef.current = now;
+      
       fetchInitialData();
-      fetchFiles(currentPath);
+      fetchFiles(currentPathRef.current);
     });
 
     return () => {

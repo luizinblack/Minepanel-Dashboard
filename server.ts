@@ -132,7 +132,7 @@ async function startServer() {
   
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 1000,
+    max: 50000, // Increased as requested
     message: { error: "Muitas requisições, tente novamente mais tarde." },
     validate: { trustProxy: false },
     skip: (req) => req.path.startsWith("/api/admin/upload")
@@ -160,6 +160,15 @@ async function startServer() {
       methods: ["GET", "POST"],
     },
   });
+
+  // Debounce for refresh_data to prevent spam
+  let refreshTimeout: any = null;
+  const emitRefresh = () => {
+    if (refreshTimeout) clearTimeout(refreshTimeout);
+    refreshTimeout = setTimeout(() => {
+      io.emit('refresh_data');
+    }, 5000); // 5s debounce window
+  };
 
   // Adaptive Rate Limiter State
   let uploadThroughput = 0; // bytes/sec
@@ -580,7 +589,7 @@ async function startServer() {
       updateJob(job.id, { status: "DONE", progress: 100 });
       logToConsole(`[MineControl] Worker: Tarefa ${job.filename} concluída.`);
 
-      io.emit("refresh_data");
+      emitRefresh();
     } catch (err: any) {
       console.error(`[WORKER ERROR] Job ${job.id}:`, err);
       updateJob(job.id, { status: "FAILED", error: err.message });
