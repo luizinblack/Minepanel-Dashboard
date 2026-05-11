@@ -19,6 +19,8 @@ import {
   Plus,
   ArrowLeft,
   Save,
+  PackageOpen,
+  Archive,
   X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -286,6 +288,29 @@ export default function App() {
         console.error(err);
       }
     },
+    extract: async (file: any) => {
+      if (!confirm(`Deseja extrair os arquivos de ${file.name}? O arquivo ZIP será excluído após a extração.`)) return;
+      try {
+        setIsUploading(true);
+        const res = await fetch('/api/files/extract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: file.name, currentPath }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert(data.message);
+          fetchFiles(currentPath);
+        } else {
+          alert("Erro na extração: " + data.error);
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Erro ao conectar com o servidor.");
+      } finally {
+        setIsUploading(false);
+      }
+    },
     goBack: () => {
       if (currentPath === ".") return;
       const parts = currentPath.split('/');
@@ -318,7 +343,7 @@ export default function App() {
 
       {/* Top Header */}
       <header className="relative z-10 border-b border-[#2d2d2d] bg-[#1a1a1a] h-16">
-        <div className="max-w-7xl mx-auto px-8 h-full flex items-center justify-between">
+        <div className="max-w-full mx-auto px-4 md:px-8 h-full flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-[#38e11d] rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(56,225,29,0.3)]">
               <ServerIcon size={20} className="text-black" />
@@ -366,7 +391,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="relative z-10 max-w-7xl mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <main className="relative z-10 max-w-full mx-auto px-4 md:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* Left Column: Stats & Monitoring */}
         <div className="lg:col-span-8 space-y-6">
@@ -593,7 +618,7 @@ export default function App() {
                    )}
 
                    <div className="grid grid-cols-1 gap-1">
-                      {fileList.sort((a, b) => b.isDirectory - a.isDirectory || a.name.localeCompare(b.name)).map(file => (
+                      {fileList.sort((a, b) => (b.isDirectory ? 1 : 0) - (a.isDirectory ? 1 : 0) || a.name.localeCompare(b.name)).map(file => (
                         <div 
                           key={file.name}
                           className="group flex items-center justify-between p-3 rounded-xl hover:bg-white/[0.03] border border-transparent hover:border-white/5 transition-all text-sm"
@@ -615,21 +640,33 @@ export default function App() {
                                  </span>
                               </div>
                            </button>
-                           <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                              {!file.isDirectory && (
+                           <div className="flex items-center gap-2">
+                              {!file.isDirectory && file.name.endsWith('.zip') && (
                                 <button 
-                                  onClick={() => handleFileAction.open(file)}
-                                  className="p-2 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white"
+                                  onClick={() => handleFileAction.extract(file)}
+                                  className="flex items-center gap-2 px-3 py-1.5 bg-[#38e11d] text-black rounded-lg text-[11px] font-black uppercase hover:bg-[#38e11d]/80 transition-all shadow-[0_0_15px_rgba(56,225,29,0.5)] animate-pulse"
+                                  title="Extrair agora e remover ZIP"
                                 >
-                                  <Edit size={16} />
+                                   <PackageOpen size={14} /> EXTRAIR AGORA
                                 </button>
                               )}
-                              <button 
-                                onClick={() => handleFileAction.delete(file)}
-                                className="p-2 hover:bg-red-500/20 rounded-lg text-red-500/50 hover:text-red-400"
-                              >
-                                 <Trash2 size={16} />
-                              </button>
+
+                              <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                 {!file.isDirectory && (
+                                   <button 
+                                     onClick={() => handleFileAction.open(file)}
+                                     className="p-2 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white"
+                                   >
+                                     <Edit size={16} />
+                                   </button>
+                                 )}
+                                 <button 
+                                   onClick={() => handleFileAction.delete(file)}
+                                   className="p-2 hover:bg-red-500/20 rounded-lg text-red-500/50 hover:text-red-400"
+                                 >
+                                    <Trash2 size={16} />
+                                 </button>
+                              </div>
                            </div>
                         </div>
                       ))}

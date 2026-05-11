@@ -293,6 +293,47 @@ async function startServer() {
     }
   });
 
+  app.post("/api/files/extract", (req, res) => {
+    const { filename, currentPath } = req.body;
+    // Previne Directory Traversal
+    const relativeDir = currentPath || ".";
+    const filePath = path.join(UPLOADS_DIR, relativeDir, filename);
+
+    if (!filePath.startsWith(UPLOADS_DIR) || !filename.endsWith('.zip')) {
+      return res.status(400).json({ error: "Arquivo inválido para extração" });
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "Arquivo não encontrado" });
+    }
+
+    const extractDir = path.dirname(filePath);
+    
+    console.log(`[ZIP] Extraindo manual: ${filename} em ${extractDir}`);
+    io.emit("console_log", `[MineControl] Extraindo manual: ${filename}...`);
+
+    // Usamos o comando system unzip para eficiência (Task 2)
+    const unzip = spawn("unzip", ["-o", filename, "-d", "."], { cwd: extractDir });
+
+    unzip.on('close', (code) => {
+      if (code === 0) {
+        try {
+          fs.unlinkSync(filePath); // Exclui o ZIP após extrair conforme solicitado
+          io.emit("console_log", `[MineControl] Extraído com sucesso. Arquivo ${filename} removido.`);
+          res.json({ message: "Extraído e removido com sucesso!" });
+        } catch (e: any) {
+          res.json({ message: "Extraído, mas houve um erro ao remover o ZIP: " + e.message });
+        }
+      } else {
+        res.status(500).json({ error: "Erro na extração do sistema. Código: " + code });
+      }
+    });
+
+    unzip.stderr.on('data', (data) => {
+      console.error(`Unzip Error output: ${data}`);
+    });
+  });
+
   app.get("/api/file/read", (req, res) => {
     const filePath = req.query.path as string;
     if (!filePath) return res.status(400).json({ error: "Path required" });
