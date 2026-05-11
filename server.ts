@@ -150,6 +150,34 @@ async function startServer() {
   let uploadThroughput = 0; // bytes/sec
   let lastThroughputUpdate = Date.now();
 
+  // Cache em memória (evita ler disco a cada requisição)
+  let usageCache: Record<string, any> = {};
+  let tenantsCache: any[] = [];
+  let plansCache: any[] = [];
+  let cacheLoaded = false;
+
+  const loadCache = async () => {
+    try {
+      if (fs.existsSync(TENANTS_PATH)) tenantsCache = JSON.parse(await fs.promises.readFile(TENANTS_PATH, 'utf-8'));
+      if (fs.existsSync(PLANS_PATH)) plansCache = JSON.parse(await fs.promises.readFile(PLANS_PATH, 'utf-8'));
+      if (fs.existsSync(USAGE_PATH)) usageCache = JSON.parse(await fs.promises.readFile(USAGE_PATH, 'utf-8'));
+      cacheLoaded = true;
+    } catch (e) {
+      console.error("Erro ao carregar cache:", e);
+    }
+  };
+
+  await loadCache();
+
+  // Persiste o cache no disco de forma assíncrona (sem bloquear)
+  const persistUsage = async () => {
+    try {
+      await fs.promises.writeFile(USAGE_PATH, JSON.stringify(usageCache, null, 2));
+    } catch (e) {
+      console.error("Erro ao persistir usage:", e);
+    }
+  };
+
   // System Monitoring
   let lastMetrics: any = {};
   const updateMetrics = async () => {
@@ -190,7 +218,7 @@ async function startServer() {
         uptime: os.uptime(),
         timestamp: Date.now(),
         saas: {
-          activeTenants: JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8')).length,
+          activeTenants: tenantsCache.length,
           totalUploads: JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8')).length
         }
       };
@@ -249,32 +277,34 @@ async function startServer() {
   };
 
   const getUsage = (tenantId: string) => {
-    const usage = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf-8'));
-    return usage[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
+    return usageCache[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
   };
 
   const updateUsage = (tenantId: string, delta: any) => {
-    const usage = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf-8'));
-    const current = usage[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
-    usage[tenantId] = {
+    const current = usageCache[tenantId] || { storageUsed: 0, bandwidthUsed: 0, uploadsCount: 0 };
+    usageCache[tenantId] = {
       storageUsed: current.storageUsed + (delta.storage || 0),
       bandwidthUsed: current.bandwidthUsed + (delta.bandwidth || 0),
       uploadsCount: current.uploadsCount + (delta.uploads || 0)
     };
-    fs.writeFileSync(USAGE_PATH, JSON.stringify(usage, null, 2));
+    persistUsage().catch(console.error);
   };
 
   const checkLimits = (req: any, res: any, next: any) => {
-    const tenantId = req.user?.tenantId || "tenant_001";
-    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
-    const plans = JSON.parse(fs.readFileSync(PLANS_PATH, 'utf-8'));
-    
-    const tenant = tenants.find((t: any) => t.id === tenantId);
-    const plan = plans.find((p: any) => p.id === tenant.planId);
-    const usage = getUsage(tenantId);
+    if (!cacheLoaded) return res.status(503).json({ error: "Servidor iniciando, tente novamente." });
 
-    if (usage.storageUsed >= plan.storageLimit * 1024 * 1024 * 1024) {
-      return res.status(403).json({ error: "Limite de armazenamento atingido. Faça upgrade do seu plano." });
+    const tenantId = req.user?.tenantId || "tenant_001";
+    const tenant = tenantsCache.find((t: any) => t.id === tenantId);
+    if (!tenant) return res.status(404).json({ error: "Tenant não encontrado" });
+
+    const plan = plansCache.find((p: any) => p.id === tenant.planId);
+    if (!plan) return res.status(404).json({ error: "Plano não encontrado" });
+
+    const usage = getUsage(tenantId);
+    const limitBytes = plan.storageLimit * 1024 * 1024 * 1024;
+
+    if (usage.storageUsed >= limitBytes) {
+      return res.status(403).json({ error: "Limite de armazenamento atingido (Quota exceeded). Faça upgrade do seu plano." });
     }
     next();
   };
@@ -596,7 +626,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/admin/upload", standardizedUpload.single("file"), (req: any, res) => {
+  app.post("/api/admin/upload", authenticateToken, checkLimits, standardizedUpload.single("file"), (req: any, res) => {
     if (!req.file) return res.status(400).json({ error: "Nenhum arquivo enviado" });
 
     const metadata = {
@@ -647,11 +677,11 @@ async function startServer() {
   // SaaS Portal Endpoints
   app.get("/api/saas/me", authenticateToken, (req: any, res) => {
     const tenantId = req.user?.tenantId || "tenant_001";
-    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
-    const plans = JSON.parse(fs.readFileSync(PLANS_PATH, 'utf-8'));
     
-    const tenant = tenants.find((t: any) => t.id === tenantId);
-    const plan = plans.find((p: any) => p.id === tenant.planId);
+    const tenant = tenantsCache.find((t: any) => t.id === tenantId);
+    if (!tenant) return res.status(404).json({ error: "Tenant não encontrado" });
+
+    const plan = plansCache.find((p: any) => p.id === tenant.planId);
     const usage = getUsage(tenantId);
 
     res.json({ tenant, plan, usage });
@@ -659,8 +689,7 @@ async function startServer() {
 
   app.post("/api/saas/auth/login", (req, res) => {
     const { email } = req.body;
-    const tenants = JSON.parse(fs.readFileSync(TENANTS_PATH, 'utf-8'));
-    const tenant = tenants.find((t: any) => t.email === email);
+    const tenant = tenantsCache.find((t: any) => t.email === email);
 
     if (!tenant) return res.status(401).json({ error: "Tenant não encontrado" });
 
@@ -671,7 +700,7 @@ async function startServer() {
   // Chunked Upload System
   const getChunkDir = (fileId: string) => path.join(CHUNKS_TEMP_DIR, fileId);
 
-  app.get("/api/admin/upload/status", (req, res) => {
+  app.get("/api/admin/upload/status", authenticateToken, (req, res) => {
     const { fileId } = req.query;
     if (!fileId) return res.status(400).json({ error: "fileId is required" });
 
@@ -693,7 +722,7 @@ async function startServer() {
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB per chunk
   });
 
-  app.post("/api/admin/upload/chunk", chunkUpload.single("chunk"), async (req: any, res) => {
+  app.post("/api/admin/upload/chunk", authenticateToken, checkLimits, chunkUpload.single("chunk"), async (req: any, res) => {
     const { fileId, index, total, fileName } = req.body;
     if (!req.file || !fileId || index === undefined || !total) {
       return res.status(400).json({ error: "Missing required chunk data" });
@@ -709,10 +738,15 @@ async function startServer() {
     const chunkCount = files.filter(f => f.startsWith('chunk-')).length;
 
     if (chunkCount === parseInt(total, 10)) {
+      // Race condition protection
+      const lockPath = path.join(chunkDir, "merge.lock");
+      if (fs.existsSync(lockPath)) return res.json({ success: true, completed: false });
+      fs.writeFileSync(lockPath, "1");
+
       // All chunks received, initial merge
       try {
         const subDir = getSubDirForMime(req.body.mimeType || 'application/octet-stream');
-        const sanitizedName = fileName.replace(/[^a-zA-Z0-9.\-_ ()]/g, '_');
+        const sanitizedName = (fileName || 'unnamed').replace(/[^a-zA-Z0-9.\-_ ()]/g, '_');
         const ext = path.extname(sanitizedName);
         const storedName = `${uuidv4()}${ext}`;
         const finalPath = path.join(STANDARDIZED_UPLOADS_DIR, subDir, storedName);
@@ -721,6 +755,7 @@ async function startServer() {
         
         for (let i = 0; i < total; i++) {
           const currentChunkPath = path.join(chunkDir, `chunk-${i}`);
+          if (!fs.existsSync(currentChunkPath)) throw new Error(`Chunk ${i} missing during merge`);
           const chunkBuffer = fs.readFileSync(currentChunkPath);
           writeStream.write(chunkBuffer);
           fs.unlinkSync(currentChunkPath); // Delete chunk after writing
@@ -729,7 +764,7 @@ async function startServer() {
         writeStream.end();
 
         await finished(writeStream);
-        fs.rmdirSync(chunkDir); // Delete temp dir
+        fs.rmSync(chunkDir, { recursive: true, force: true }); // Delete temp dir including lock
 
         const metadata = {
           id: uuidv4(),
@@ -756,8 +791,9 @@ async function startServer() {
         auditLog("info", `Chunked Upload Finalizado: ${metadata.originalName}`, { metadata });
         return res.json({ success: true, completed: true, metadata });
       } catch (e: any) {
+        if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
         auditLog("error", "Error merging chunks", { error: e.message });
-        return res.status(500).json({ error: "Falha ao processar arquivo final" });
+        return res.status(500).json({ error: "Falha ao processar arquivo final: " + e.message });
       }
     }
 

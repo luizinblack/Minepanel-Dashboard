@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'motion/react';
+import pLimit from 'p-limit';
 import { 
   XAxis, 
   YAxis, 
@@ -44,6 +45,9 @@ import { cn } from './lib/utils';
 
 // Socket connection
 const socket = io();
+
+// Limite global compartilhado entre TODOS os arquivos
+const globalUploadLimit = pLimit(3);
 
 interface SystemStats {
   cpu: {
@@ -358,14 +362,19 @@ export default function App() {
     const { 
       onProgress = () => {}, 
       fileId = `${file.name}-${file.size}-${file.lastModified}`,
-      MAX_CONCURRENT = 2,
-      CHUNK_SIZE = 2 * 1024 * 1024 // 2MB
+      CHUNK_SIZE = 5 * 1024 * 1024, // 5MB per chunk (optimized for large sets)
+      sharedLimit = globalUploadLimit
     } = options;
 
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    
+    const headers: any = { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` };
+
     // 1. Check status (Resume support)
-    const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`);
+    const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`, { headers });
+    if (!statusRes.ok) {
+       const errData = await statusRes.json().catch(() => ({}));
+       throw new Error(errData.error || `Failed to check upload status: ${statusRes.status}`);
+    }
     const { uploadedChunks } = await statusRes.json();
     
     const remainingChunks = [];
@@ -378,57 +387,56 @@ export default function App() {
        return;
     }
 
-    // 2. Upload queue with concurrency control
+    // 2. Upload queue with global concurrency control and retry logic
     let finishedChunks = totalChunks - remainingChunks.length;
     
-    const uploadWithRetry = async (index: number, attempt = 1): Promise<void> => {
-      try {
-        const start = index * CHUNK_SIZE;
-        const end = Math.min(file.size, start + CHUNK_SIZE);
-        const chunk = file.slice(start, end);
+    const tasks = remainingChunks.map(index => sharedLimit(async () => {
+      let attempts = 0;
+      const maxAttempts = 3;
 
-        const formData = new FormData();
-        formData.append('chunk', chunk);
-        formData.append('fileId', fileId);
-        formData.append('index', index.toString());
-        formData.append('total', totalChunks.toString());
-        formData.append('fileName', file.name);
-        formData.append('mimeType', file.type);
+      while (attempts < maxAttempts) {
+        try {
+          const start = index * CHUNK_SIZE;
+          const end = Math.min(file.size, start + CHUNK_SIZE);
+          const chunk = file.slice(start, end);
 
-        const res = await fetch('/api/admin/upload/chunk', {
-          method: 'POST',
-          body: formData,
-        });
+          const formData = new FormData();
+          formData.append('chunk', chunk);
+          formData.append('fileId', fileId);
+          formData.append('index', index.toString());
+          formData.append('total', totalChunks.toString());
+          formData.append('fileName', file.name);
+          formData.append('mimeType', file.type);
 
-        if (!res.ok) {
-           if (res.status === 429) throw new Error("Rate limit exceeded");
-           throw new Error(`Upload failed: ${res.status}`);
+          const res = await fetch('/api/admin/upload/chunk', {
+            method: 'POST',
+            headers,
+            body: formData,
+          });
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            // Don't retry if it's a quota issue
+            if (res.status === 403) throw new Error(errData.error || "Limite atingido (Quota exceeded)");
+            if (res.status === 429) throw new Error("Muitas requisições (Rate Limit)");
+            throw new Error(errData.error || `Upload failed: ${res.status}`);
+          }
+          
+          finishedChunks++;
+          onProgress(Math.round((finishedChunks / totalChunks) * 100));
+          return; // Success
+        } catch (err: any) {
+          attempts++;
+          if (attempts >= maxAttempts || err.message.includes("Limite atingido")) {
+            throw err;
+          }
+          // Exponential backoff
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempts)));
         }
-        
-        finishedChunks++;
-        onProgress(Math.round((finishedChunks / totalChunks) * 100));
-      } catch (err: any) {
-        if (attempt >= 5) throw err;
-        const delay = 1000 * Math.pow(2, attempt); // Exponential backoff
-        await new Promise(r => setTimeout(r, delay));
-        return uploadWithRetry(index, attempt + 1);
       }
-    };
+    }));
 
-    const queue = [...remainingChunks];
-    const workers = [];
-    
-    for (let i = 0; i < Math.min(MAX_CONCURRENT, queue.length); i++) {
-      const worker = async () => {
-        while (queue.length > 0) {
-          const index = queue.shift()!;
-          await uploadWithRetry(index);
-        }
-      };
-      workers.push(worker());
-    }
-
-    await Promise.all(workers);
+    await Promise.all(tasks);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -472,13 +480,17 @@ export default function App() {
     setActiveUploads(prev => [...prev, newUpload]);
 
     try {
+      const tasks = [];
       for (let i = 0; i < totalFiles; i++) {
         const file = files[i];
-        await uploadChunked(file);
-        processedCount++;
-        const p = Math.round((processedCount / totalFiles) * 100);
-        setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: p, count: `${processedCount}/${totalFiles}` } : u));
+        tasks.push((async () => {
+           await uploadChunked(file);
+           processedCount++;
+           const p = Math.round((processedCount / totalFiles) * 100);
+           setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: p, count: `${processedCount}/${totalFiles}` } : u));
+        })());
       }
+      await Promise.all(tasks);
       setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: 100, status: 'done' } : u));
       setTimeout(() => {
         setActiveUploads(prev => prev.filter(u => u.id !== folderUploadId));
