@@ -173,6 +173,35 @@ async function startServer() {
     res.json({ success: true, message: `Chunk ${chunkIndex}/${totalChunks} saved` });
   });
 
+  // Helper para extração ZIP segura e assíncrona
+  const extractZipSafe = async (filePath: string, outputPath: string, logLabel: string) => {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Arquivo ZIP não encontrado: ${filePath}`);
+    }
+
+    // Validação de integridade: verificar tamanho do arquivo
+    const stats = fs.statSync(filePath);
+    if (stats.size === 0) {
+      throw new Error(`Arquivo ZIP corrompido ou vazio (0 bytes).`);
+    }
+
+    console.log(`[ZIP] ${logLabel}: Iniciando extração de ${filePath} (${stats.size} bytes)`);
+    io.emit("console_log", `[MineControl] ${logLabel}: Extraindo arquivos (${(stats.size/1024/1024).toFixed(2)} MB)...`);
+    
+    try {
+      // Extração via stream com unzipper.promise() para garantir conclusão
+      await fs.createReadStream(filePath)
+        .pipe(unzipper.Extract({ path: outputPath }))
+        .promise();
+      
+      console.log(`[ZIP] ${logLabel}: Extração finalizada com sucesso.`);
+      io.emit("console_log", `[MineControl] ${logLabel}: Extração concluída.`);
+    } catch (err: any) {
+      console.error(`[ZIP] ${logLabel}: Erro durante extração: ${err.message}`);
+      throw err;
+    }
+  };
+
   app.post("/api/upload/finalize", express.json(), async (req, res) => {
     const { filename, totalChunks } = req.body;
     const finalPath = path.join(UPLOADS_DIR, filename);
@@ -183,53 +212,44 @@ async function startServer() {
       
       for (let i = 0; i < totalChunks; i++) {
         const chunkPath = path.join(chunkDir, `chunk-${i}`);
-        const chunkBuffer = fs.readFileSync(chunkPath);
-        writeStream.write(chunkBuffer);
-        fs.unlinkSync(chunkPath); // Limpa o chunk após usar
+        if (fs.existsSync(chunkPath)) {
+          const chunkBuffer = fs.readFileSync(chunkPath);
+          writeStream.write(chunkBuffer);
+          fs.unlinkSync(chunkPath);
+        }
       }
       
       writeStream.end();
 
       writeStream.on('finish', async () => {
-        fs.rmSync(chunkDir, { recursive: true, force: true });
+        try {
+          fs.rmSync(chunkDir, { recursive: true, force: true });
 
-        if (filename.endsWith('.zip')) {
-          console.log(`[ZIP] Iniciando extração pesada via unzipper: ${filename}`);
-          io.emit("console_log", `[MineControl] Extraindo arquivo grande: ${filename}...`);
+          if (filename.endsWith('.zip')) {
+            await extractZipSafe(finalPath, UPLOADS_DIR, "Upload Chunk");
+            
+            const filesAfter = fs.readdirSync(UPLOADS_DIR);
+            const jarFile = filesAfter.find(f => f.endsWith('.jar'));
+            if (jarFile && !serverJarName) serverJarName = jarFile;
 
-          try {
-            const extractStream = fs.createReadStream(finalPath)
-              .pipe(unzipper.Extract({ path: UPLOADS_DIR }));
-
-            extractStream.on('close', () => {
-              console.log(`[ZIP] Extração concluída via unzipper.`);
-              io.emit("console_log", `[MineControl] Extração concluída com sucesso!`);
-              
-              const files = fs.readdirSync(UPLOADS_DIR);
-              const jarFile = files.find(f => f.endsWith('.jar'));
-              if (jarFile && !serverJarName) serverJarName = jarFile;
-
-              res.json({ message: "Servidor extraído com sucesso!", filename, extracted: true });
-            });
-
-            extractStream.on('error', (err) => {
-              console.error(`[ZIP] Erro na extração: ${err.message}`);
-              res.status(500).json({ error: "Erro na extração via unzipper: " + err.message });
-            });
-          } catch (e: any) {
-             res.status(500).json({ error: "Erro ao iniciar stream de extração: " + e.message });
+            res.json({ message: "Backup enviado e extraído com sucesso!", filename, extracted: true, detectedJar: jarFile });
+          } else {
+            res.json({ message: "Arquivo enviado e reconstruído com sucesso!", filename });
           }
-        } else {
-          res.json({ message: "Arquivo carregado e reconstruído com sucesso!", filename });
+        } catch (extractErr: any) {
+          res.status(500).json({ error: "Erro na extração pós-upload: " + extractErr.message });
         }
+      });
+
+      writeStream.on('error', (err) => {
+        res.status(500).json({ error: "Erro ao gravar arquivo final: " + err.message });
       });
     } catch (err: any) {
       res.status(500).json({ error: "Erro ao finalizar upload: " + err.message });
     }
   });
 
-  app.post("/api/upload", upload.single("file"), (req: any, res) => {
-
+  app.post("/api/upload", upload.single("file"), async (req: any, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "Nenhum arquivo enviado" });
     }
@@ -238,37 +258,22 @@ async function startServer() {
 
     try {
       if (originalname.endsWith('.zip')) {
-        console.log(`[ZIP] Iniciando extração de: ${originalname}`);
+        await extractZipSafe(filePath, UPLOADS_DIR, "Upload Simples");
         
-        fs.createReadStream(filePath)
-          .pipe(unzipper.Extract({ path: UPLOADS_DIR }))
-          .on('close', () => {
-            console.log(`[ZIP] Extração concluída: ${originalname}`);
-            
-            // Scan for a .jar file
-            const files = fs.readdirSync(UPLOADS_DIR);
-            const jarFile = files.find(f => f.endsWith('.jar'));
-            if (jarFile && !serverJarName) {
-                serverJarName = jarFile;
-            }
+        const filesAfter = fs.readdirSync(UPLOADS_DIR);
+        const jarFile = filesAfter.find(f => f.endsWith('.jar'));
+        if (jarFile && !serverJarName) serverJarName = jarFile;
 
-            res.json({ 
-              message: "Servidor extraído e salvo com sucesso!", 
-              filename: originalname,
-              extracted: true,
-              detectedJar: jarFile
-            });
-          })
-          .on('error', (err) => {
-            console.error("Unzip error:", err);
-            res.status(500).json({ error: "Erro ao extrair arquivo: " + err.message });
-          });
-          
-        return; // Retornamos aqui pois o res.json está no callback
+        return res.json({ 
+          message: "Servidor extraído e salvo com sucesso!", 
+          filename: originalname,
+          extracted: true,
+          detectedJar: jarFile
+        });
       }
 
       if (originalname.endsWith('.jar')) {
-          serverJarName = originalname;
+        serverJarName = originalname;
       }
 
       return res.json({ 
@@ -304,7 +309,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/files/extract", (req, res) => {
+  app.post("/api/files/extract", async (req, res) => {
     const { filename, currentPath } = req.body;
     // Previne Directory Traversal
     const relativeDir = currentPath || ".";
@@ -320,29 +325,19 @@ async function startServer() {
 
     const extractDir = path.dirname(filePath);
     
-    console.log(`[ZIP] Extraindo manual via unzipper: ${filename} em ${extractDir}`);
-    io.emit("console_log", `[MineControl] Extraindo manual: ${filename}...`);
-
     try {
-      const extractStream = fs.createReadStream(filePath)
-        .pipe(unzipper.Extract({ path: extractDir }));
+      await extractZipSafe(filePath, extractDir, "Extração Manual");
+      
+      try {
+        fs.unlinkSync(filePath); // Exclui o ZIP após extrair conforme solicitado
+        io.emit("console_log", `[MineControl] Arquivo original ${filename} removido após extração.`);
+      } catch (e: any) {
+        console.warn(`[ZIP] Falha ao remover ZIP original: ${e.message}`);
+      }
 
-      extractStream.on('close', () => {
-        try {
-          fs.unlinkSync(filePath); // Exclui o ZIP após extrair conforme solicitado
-          io.emit("console_log", `[MineControl] Extraído com sucesso. Arquivo ${filename} removido.`);
-          res.json({ message: "Extraído e removido com sucesso!" });
-        } catch (e: any) {
-          res.json({ message: "Extraído, mas houve um erro ao remover o ZIP: " + e.message });
-        }
-      });
-
-      extractStream.on('error', (err) => {
-        console.error(`[ZIP] Erro na extração manual: ${err.message}`);
-        res.status(500).json({ error: "Erro na extração via unzipper: " + err.message });
-      });
+      res.json({ message: "Extraído com sucesso!" });
     } catch (err: any) {
-      res.status(500).json({ error: "Falha ao iniciar extração: " + err.message });
+      res.status(500).json({ error: "Erro na extração: " + err.message });
     }
   });
 
