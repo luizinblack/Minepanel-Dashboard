@@ -12,6 +12,14 @@ import fs from "fs";
 import unzipper from "unzipper";
 import crypto from "crypto";
 import { finished } from "stream/promises";
+import * as dotenv from "dotenv";
+
+// Initialize environment variables
+dotenv.config();
+
+import compression from "compression";
+import rateLimit from "express-rate-limit";
+import { v4 as uuidv4 } from "uuid";
 import { 
   searchModrinth, 
   searchCurseForge, 
@@ -54,15 +62,19 @@ const MODPACKS_CACHE_PATH = path.join(__dirname, "modpacks_cache.json");
 
 const PORT = 3000;
 const UPLOADS_DIR = path.join(__dirname, "server_files");
+const STANDARDIZED_UPLOADS_DIR = path.join(__dirname, "uploads");
 const LOGS_DIR = path.join(__dirname, "logs");
 const LATEST_LOG_PATH = path.join(LOGS_DIR, "latest.log");
+const UPLOAD_METADATA_PATH = path.join(__dirname, "upload_metadata.json");
 
 // Ensure directories exist
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR);
-}
-if (!fs.existsSync(LOGS_DIR)) {
-  fs.mkdirSync(LOGS_DIR);
+const dirs = [UPLOADS_DIR, STANDARDIZED_UPLOADS_DIR, LOGS_DIR, path.join(STANDARDIZED_UPLOADS_DIR, "images"), path.join(STANDARDIZED_UPLOADS_DIR, "videos"), path.join(STANDARDIZED_UPLOADS_DIR, "documents")];
+dirs.forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+if (!fs.existsSync(UPLOAD_METADATA_PATH)) {
+  fs.writeFileSync(UPLOAD_METADATA_PATH, JSON.stringify([]));
 }
 // Clear latest log on startup
 fs.writeFileSync(LATEST_LOG_PATH, `--- MineControl Log Started at ${new Date().toLocaleString()} ---\n`);
@@ -93,12 +105,109 @@ const upload = multer({ storage });
 
 async function startServer() {
   const app = express();
+  
+  // Security & Performance Middlewares
+  app.use(compression());
+  app.use(express.json());
+  
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 1000, // Limit each IP to 1000 requests per windowMs
+    message: { error: "Muitas requisições, tente novamente mais tarde." }
+  });
+  app.use("/api/", limiter);
+
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
     cors: {
       origin: "*",
       methods: ["GET", "POST"],
     },
+  });
+
+  // System Monitoring
+  let lastMetrics = {};
+  const updateMetrics = async () => {
+    try {
+      const [cpu, mem, load, gpu, temp] = await Promise.all([
+        si.currentLoad(),
+        si.mem(),
+        si.fullLoad(),
+        si.graphics(),
+        si.cpuTemperature()
+      ]);
+
+      const metrics = {
+        cpu: {
+          usage: Math.round(cpu.currentLoad),
+          cores: cpu.cpus.length,
+          temp: temp.main || temp.max || 0
+        },
+        ram: {
+          total: Math.round(mem.total / 1024 / 1024),
+          used: Math.round(mem.active / 1024 / 1024),
+          free: Math.round(mem.free / 1024 / 1024),
+          percent: Math.round((mem.active / mem.total) * 100)
+        },
+        gpu: gpu.controllers.length > 0 ? {
+          name: gpu.controllers[0].model,
+          usage: gpu.controllers[0].utilizationGpu || 0,
+          temp: gpu.controllers[0].temperatureGpu || 0,
+          memoryUsed: gpu.controllers[0].memoryUsed || 0,
+          memoryTotal: gpu.controllers[0].memoryTotal || 0,
+        } : null,
+        uptime: os.uptime(),
+        timestamp: Date.now()
+      };
+      
+      lastMetrics = metrics;
+      io.emit("system_metrics", metrics);
+    } catch (e) {
+      console.error("Error updating metrics:", e);
+    }
+  };
+
+  updateMetrics();
+  setInterval(updateMetrics, 2000);
+
+  // Centralized Logger
+  const auditLog = (level: "info" | "warn" | "error", message: string, details?: any) => {
+    const entry = {
+      level,
+      message,
+      details,
+      timestamp: new Date().toISOString(),
+      uptime: os.uptime()
+    };
+    const logPath = path.join(LOGS_DIR, `${new Date().toISOString().split('T')[0]}.log`);
+    fs.appendFileSync(logPath, JSON.stringify(entry) + "\n");
+    if (level === 'error') console.error(`[AUDIT ERROR] ${message}`, details || "");
+  };
+
+  // Logging Middleware
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      if (req.path.startsWith('/api/') && !req.path.includes('/metrics')) {
+        auditLog("info", `API Call: ${req.method} ${req.path}`, { duration, status: res.statusCode });
+      }
+    });
+    next();
+  });
+
+  // Health Check
+  app.get("/api/health", (req, res) => {
+    res.json({
+      status: "ok",
+      uptime: Math.round(os.uptime()),
+      memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
+      serverStatus
+    });
+  });
+
+  app.get("/api/system/metrics", (req, res) => {
+    res.json(lastMetrics);
   });
 
   let minecraftProcess: ChildProcess | null = null;
@@ -132,6 +241,15 @@ async function startServer() {
     }
   };
 
+  const stripRootFolder = (relPath: string) => {
+    const parts = relPath.split("/");
+    if (parts.length > 1) {
+      parts.shift(); // Ignorar a primeira pasta (raiz enviada pelo navegador)
+      return parts.join("/");
+    }
+    return relPath;
+  };
+
   const logToConsole = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
     const formatted = `[${timestamp}] ${message}\n`;
@@ -152,18 +270,18 @@ async function startServer() {
     const PAGE_SIZE = 50;
 
     try {
-      // Sync Modrinth (First 250 modpacks)
+      // Sync Modrinth (Up to 1000 modpacks)
       logToConsole(`[Modrinth] Sincronizando principais modpacks...`);
-      for (let offset = 0; offset < 250; offset += PAGE_SIZE) {
+      for (let offset = 0; offset < 1000; offset += PAGE_SIZE) {
         const page = await searchModrinth("", PAGE_SIZE, offset);
         if (page.length === 0) break;
         allModpacks.push(...page);
         logToConsole(`[Modrinth] Sincronizados ${allModpacks.length} itens...`);
       }
 
-      // Sync CurseForge (First 250 modpacks)
+      // Sync CurseForge (Up to 1000 modpacks)
       logToConsole(`[CurseForge] Sincronizando principais modpacks...`);
-      for (let index = 0; index < 250; index += PAGE_SIZE) {
+      for (let index = 0; index < 1000; index += PAGE_SIZE) {
         const page = await searchCurseForge("", index, PAGE_SIZE);
         if (page.length === 0) break;
         allModpacks.push(...page);
@@ -194,18 +312,30 @@ async function startServer() {
   }
 
   const findStartScript = (dir: string): string | null => {
+    if (!fs.existsSync(dir)) return null;
     const files = fs.readdirSync(dir);
     
-    // Priority specific names
-    const priority = ["start_server.bat", "run.bat", "start.bat", "start_server.sh", "run.sh", "start.sh"];
-    for (const name of priority) {
+    // Priority specific names (MANDATORY ORDER)
+    const PRIORITY = [
+      "start_server.bat",
+      "run.bat",
+      "start.bat",
+      "launch.bat",
+      "serverstart.bat",
+      "start_server.sh",
+      "run.sh",
+      "start.sh"
+    ];
+
+    // 1. Check for priority files in CURRENT dir
+    for (const name of PRIORITY) {
       const fullPath = path.join(dir, name);
       if (fs.existsSync(fullPath) && !fs.statSync(fullPath).isDirectory()) {
         return fullPath;
       }
     }
 
-    // Recursive scan
+    // 2. Recursive scan if not found in current dir
     for (const file of files) {
       const fullPath = path.join(dir, file);
       const stat = fs.statSync(fullPath);
@@ -351,7 +481,76 @@ async function startServer() {
     serverJarName = jars[0];
   }
 
-  // API Routes
+  // Standardized Upload System
+  const getSubDirForMime = (mime: string) => {
+    if (mime.startsWith('image/')) return 'images';
+    if (mime.startsWith('video/')) return 'videos';
+    return 'documents';
+  };
+
+  const standardizedStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      const subDir = getSubDirForMime(file.mimetype);
+      cb(null, path.join(STANDARDIZED_UPLOADS_DIR, subDir));
+    },
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname);
+      const uuid = uuidv4();
+      cb(null, `${uuid}${ext}`);
+    }
+  });
+
+  const standardizedUpload = multer({
+    storage: standardizedStorage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+    fileFilter: (req, file, cb) => {
+      const allowed = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'application/pdf', 'application/zip', 'text/plain'];
+      if (allowed.includes(file.mimetype) || file.originalname.endsWith('.jar')) {
+        cb(null, true);
+      } else {
+        cb(new Error("Tipo de arquivo não permitido"));
+      }
+    }
+  });
+
+  app.post("/api/admin/upload", standardizedUpload.single("file"), (req: any, res) => {
+    if (!req.file) return res.status(400).json({ error: "Nenhum arquivo enviado" });
+
+    const metadata = {
+      id: uuidv4(),
+      originalName: req.file.originalname.replace(/[^a-zA-Z0-9.\-_ ()]/g, '_'),
+      storedName: req.file.filename,
+      size: req.file.size,
+      type: req.file.mimetype,
+      uploadedAt: new Date().toISOString(),
+      category: getSubDirForMime(req.file.mimetype)
+    };
+
+    const currentMetadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
+    currentMetadata.push(metadata);
+    fs.writeFileSync(UPLOAD_METADATA_PATH, JSON.stringify(currentMetadata, null, 2));
+
+    auditLog("info", `Upload realizado: ${metadata.originalName}`, { metadata });
+    res.json(metadata);
+  });
+
+  app.get("/api/admin/logs", (req, res) => {
+    const logPath = path.join(LOGS_DIR, `${new Date().toISOString().split('T')[0]}.log`);
+    if (!fs.existsSync(logPath)) return res.json([]);
+
+    try {
+      const content = fs.readFileSync(logPath, 'utf-8');
+      const logs = content.split('\n').filter(l => l.trim().length > 0).map(l => JSON.parse(l));
+      res.json(logs.slice(-50)); // Last 50 logs
+    } catch (e) {
+      res.status(500).json([]);
+    }
+  });
+
+  app.get("/api/admin/uploads", (req, res) => {
+    const metadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
+    res.json(metadata);
+  });
   app.get("/api/status", (req, res) => {
     const script = findStartScript(UPLOADS_DIR);
     const hasScript = !!script;
@@ -374,30 +573,62 @@ async function startServer() {
 
     try {
       let results: any[] = [];
+      let total = 0;
+      let hasMore = false;
 
-      // If there's a search query, fetch from APIs live for better relevance
-      if (q && q !== "") {
-        const [modrinth, curseforge] = await Promise.all([
-          searchModrinth(q as string, limitNum, offset),
-          searchCurseForge(q as string, offset, limitNum)
-        ]);
-        results = [...modrinth, ...curseforge];
-      } else {
-        // Use local cache for browsing
+      // Use cache for browsing, but allow live search for specific queries
+      if (!q || q === "") {
         if (fs.existsSync(MODPACKS_CACHE_PATH)) {
           const cache = JSON.parse(fs.readFileSync(MODPACKS_CACHE_PATH, 'utf-8'));
           results = cache.modpacks || [];
-        } else {
-          // Fallback if no cache
-          const [modrinth, curseforge] = await Promise.all([
-            searchModrinth("", limitNum, offset),
-            searchCurseForge("", offset, limitNum)
-          ]);
-          results = [...modrinth, ...curseforge];
+          total = results.length;
+          
+          // Apply Filters to cache results
+          if (loader) {
+            results = results.filter(m => m.loaders?.some((l: string) => l.toLowerCase().includes((loader as string).toLowerCase())));
+          }
+          if (version) {
+            results = results.filter(m => m.minecraft_versions?.includes(version as string));
+          }
+
+          // Apply Sorting
+          if (sort === 'downloads') {
+            results.sort((a, b) => b.downloads - a.downloads);
+          } else if (sort === 'updated') {
+            results.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          }
+
+          const paginated = results.slice(offset, offset + limitNum);
+          hasMore = offset + limitNum < results.length;
+          
+          // If we reach the end of cache, fetch more live IF possible
+          if (!hasMore && offset < 5000) { // Limit live fallback for stability
+             const [liveModrinth, liveCurse] = await Promise.all([
+               searchModrinth("", limitNum, offset),
+               searchCurseForge("", offset, limitNum)
+             ]);
+             const combined = [...liveModrinth, ...liveCurse];
+             if (combined.length > 0) {
+               return res.json({ projects: combined, total: 5000, hasMore: true });
+             }
+          }
+
+          return res.json({ 
+            projects: paginated,
+            total: results.length,
+            hasMore
+          });
         }
       }
 
-      // Apply Filters
+      // Live search for queries or if no cache
+      const [modrinth, curseforge] = await Promise.all([
+        searchModrinth((q as string) || "", limitNum, offset),
+        searchCurseForge((q as string) || "", offset, limitNum)
+      ]);
+      results = [...modrinth, ...curseforge];
+      
+      // Apply Filters to live results
       if (loader) {
         results = results.filter(m => m.loaders?.some((l: string) => l.toLowerCase().includes((loader as string).toLowerCase())));
       }
@@ -405,20 +636,10 @@ async function startServer() {
         results = results.filter(m => m.minecraft_versions?.includes(version as string));
       }
 
-      // Apply Sorting
-      if (sort === 'downloads') {
-        results.sort((a, b) => b.downloads - a.downloads);
-      } else if (sort === 'updated') {
-        results.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-      }
-
-      // Paginate results
-      const paginated = results.slice(offset, offset + limitNum);
-      
       res.json({ 
-        projects: paginated,
-        total: results.length,
-        hasMore: offset + limitNum < results.length
+        projects: results,
+        total: 10000, // Approximate total for infinite scroll
+        hasMore: results.length >= limitNum
       });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -582,7 +803,7 @@ async function startServer() {
   if (!fs.existsSync(CHUNKS_TEMP_DIR)) fs.mkdirSync(CHUNKS_TEMP_DIR);
 
   app.post("/api/upload/chunk", multer().single("chunk"), (req: any, res) => {
-    const { filename, chunkIndex, totalChunks } = req.body;
+    const { filename, chunkIndex, totalChunks, relPath } = req.body;
     const chunk = req.file;
 
     if (!chunk) return res.status(400).json({ error: "No chunk received" });
@@ -597,8 +818,18 @@ async function startServer() {
   });
 
   app.post("/api/upload/finalize", express.json(), async (req, res) => {
-    const { filename, totalChunks } = req.body;
-    const finalPath = path.join(UPLOADS_DIR, filename);
+    const { filename, totalChunks, relPath } = req.body;
+    
+    // Process Relative Path (Strip root folder)
+    let processedRelPath = "";
+    if (relPath) {
+      processedRelPath = stripRootFolder(relPath);
+    }
+
+    const finalPath = path.join(UPLOADS_DIR, processedRelPath, filename);
+    const finalDir = path.dirname(finalPath);
+    if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
+
     const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
 
     const jobId = `upload-${Date.now()}`;
@@ -652,14 +883,20 @@ async function startServer() {
     }
 
     const { originalname, path: filePath } = req.file;
-    const relPath = req.body.relPath || "";
+    let relPath = req.body.relPath || "";
+    
+    // Strip root if folder upload
+    if (relPath) {
+      relPath = stripRootFolder(relPath);
+    }
+
     const jobId = `direct-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
     const newJob: ServerJob = {
       id: jobId,
       filename: relPath ? path.join(relPath, originalname) : originalname,
       filePath: filePath,
-      outputPath: UPLOADS_DIR,
+      outputPath: path.join(UPLOADS_DIR, relPath), // Ensure we set correct output path
       status: "QUEUED",
       createdAt: Date.now(),
       progress: 100

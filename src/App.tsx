@@ -43,15 +43,25 @@ import { cn } from './lib/utils';
 const socket = io();
 
 interface SystemStats {
-  cpuLoad: string;
-  cpuModel: string;
-  ram: {
-    used: string;
-    total: string;
-    percent: string;
+  cpu: {
+    usage: number;
+    cores: number;
+    temp: number;
   };
-  gpu: string;
-  gpuVram: number;
+  ram: {
+    total: number;
+    used: number;
+    free: number;
+    percent: number;
+  };
+  gpu: {
+    name: string;
+    usage: number;
+    temp: number;
+    memoryUsed: number;
+    memoryTotal: number;
+  } | null;
+  uptime: number;
   timestamp: string;
 }
 
@@ -99,6 +109,7 @@ export default function App() {
   const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
   const [newName, setNewName] = useState("");
   const [command, setCommand] = useState("");
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
   
   // Marketplace States
   const [marketQuery, setMarketQuery] = useState("");
@@ -155,16 +166,16 @@ export default function App() {
       console.warn("API status fetch failed (expected if server hasn't restarted yet)");
     }
 
-    socket.on('system_stats', (newStats: SystemStats) => {
-      setStats(newStats);
+    socket.on('system_metrics', (newMetrics: SystemStats) => {
+      setStats(newMetrics);
       setStatsHistory(prev => {
-        const cpuVal = parseFloat(newStats.cpuLoad);
-        const ramVal = parseFloat(newStats.ram.percent);
+        const cpuVal = newMetrics.cpu.usage;
+        const ramVal = newMetrics.ram.percent;
         const next = [...prev, {
-          time: newStats.timestamp,
-          cpu: isNaN(cpuVal) ? 0 : cpuVal,
-          ram: isNaN(ramVal) ? 0 : ramVal
-        }].slice(-20);
+          time: new Date(newMetrics.timestamp).toLocaleTimeString(),
+          cpu: cpuVal,
+          ram: ramVal
+        }].slice(-30);
         return next;
       });
     });
@@ -198,7 +209,11 @@ export default function App() {
           setHasScript(data.hasScript);
         });
       fetchFiles(currentPath);
+      fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs).catch(() => {});
     });
+
+    // Initial audit logs fetch
+    fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs).catch(() => {});
 
     // Initial data fetch
     const fetchInitialData = async () => {
@@ -280,6 +295,71 @@ export default function App() {
     }
   };
 
+  const uploadChunked = async (file: File, relativePath: string = "") => {
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const filename = file.name;
+    const PARALLEL_UPLOADS = 3;
+    let uploadedChunks = 0;
+
+    // Helper to upload a single chunk
+    const uploadChunk = async (i: number) => {
+      if (i >= totalChunks) return;
+
+      let success = false;
+      let retries = 3;
+
+      while (!success && retries > 0) {
+        try {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(file.size, start + CHUNK_SIZE);
+          const chunk = file.slice(start, end);
+
+          const formData = new FormData();
+          formData.append('chunk', chunk);
+          formData.append('filename', filename);
+          formData.append('chunkIndex', i.toString());
+          formData.append('totalChunks', totalChunks.toString());
+          formData.append('relPath', relativePath); // Send the directory path
+
+          const res = await fetch('/api/upload/chunk', {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!res.ok) throw new Error(`Status ${res.status}`);
+          success = true;
+        } catch (err) {
+          retries--;
+          if (retries === 0) throw err;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+      
+      uploadedChunks++;
+      // We don't update global progress here if we are doing multiple files
+      // but we could if we wanted to.
+      await uploadChunk(i + PARALLEL_UPLOADS);
+    };
+
+    const pool = [];
+    for (let i = 0; i < Math.min(PARALLEL_UPLOADS, totalChunks); i++) {
+      pool.push(uploadChunk(i));
+    }
+    await Promise.all(pool);
+
+    const finalizeRes = await fetch('/api/upload/finalize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, totalChunks, relPath: relativePath }),
+    });
+
+    if (!finalizeRes.ok) {
+      const data = await finalizeRes.json();
+      throw new Error(data.error || "Erro ao finalizar upload");
+    }
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -287,66 +367,9 @@ export default function App() {
     setIsUploading(true);
     setUploadProgress(0);
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks recommended
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const filename = file.name;
-    const PARALLEL_UPLOADS = 4;
-    let uploadedChunks = 0;
-
     try {
-      const uploadChunk = async (i: number) => {
-        if (i >= totalChunks) return;
-
-        let success = false;
-        let retries = 3;
-
-        while (!success && retries > 0) {
-          try {
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(file.size, start + CHUNK_SIZE);
-            const chunk = file.slice(start, end);
-
-            const formData = new FormData();
-            formData.append('chunk', chunk);
-            formData.append('filename', filename);
-            formData.append('chunkIndex', i.toString());
-            formData.append('totalChunks', totalChunks.toString());
-
-            const res = await fetch('/api/upload/chunk', {
-              method: 'POST',
-              body: formData,
-            });
-
-            if (!res.ok) throw new Error(`Status ${res.status}`);
-            success = true;
-          } catch (err) {
-            retries--;
-            if (retries === 0) throw err;
-            await new Promise(r => setTimeout(r, 1000));
-          }
-        }
-        
-        uploadedChunks++;
-        setUploadProgress(Math.round((uploadedChunks / totalChunks) * 100));
-        await uploadChunk(i + PARALLEL_UPLOADS);
-      };
-
-      const pool = [];
-      for (let i = 0; i < Math.min(PARALLEL_UPLOADS, totalChunks); i++) {
-        pool.push(uploadChunk(i));
-      }
-      await Promise.all(pool);
-
-      const finalizeRes = await fetch('/api/upload/finalize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename, totalChunks }),
-      });
-
-      if (!finalizeRes.ok) {
-        const data = await finalizeRes.json();
-        throw new Error(data.error || "Erro ao finalizar upload");
-      }
+      await uploadChunked(file);
+      setUploadProgress(100);
     } catch (err: any) {
       console.error(err);
       alert("Falha no upload: " + err.message);
@@ -365,53 +388,23 @@ export default function App() {
     setUploadProgress(0);
 
     const totalFiles = files.length;
-    let uploadedCount = 0;
-    const CONCURRENCY = 6; // Folder uploads can handle more parallel files
+    let processedCount = 0;
 
     try {
-      const uploadFile = async (index: number) => {
-        if (index >= totalFiles) return;
-        
-        const file = files[index];
+      // For folder uploads, we process files one by one to keep it stable, 
+      // but each file gets chunked if large.
+      for (let i = 0; i < totalFiles; i++) {
+        const file = files[i];
         const fullPath = (file as any).webkitRelativePath || file.name;
-        // The spec strictly mandates using webkitRelativePath to preserve structure
         const relativeDir = fullPath.includes('/') ? fullPath.substring(0, fullPath.lastIndexOf('/')) : '';
         
-        let success = false;
-        let retries = 3;
-
-        while (!success && retries > 0) {
-          try {
-            const formData = new FormData();
-            formData.append('relPath', relativeDir);
-            formData.append('file', file);
-
-            const res = await fetch('/api/upload', {
-              method: 'POST',
-              body: formData,
-            });
-
-            if (!res.ok) throw new Error("Server error");
-            success = true;
-          } catch (err) {
-            retries--;
-            if (retries === 0) console.warn(`Failed to upload ${fullPath}`);
-            else await new Promise(r => setTimeout(r, 1000));
-          }
-        }
-
-        if (success) uploadedCount++;
-        setUploadProgress(Math.round(((index + 1) / totalFiles) * 100));
-        await uploadFile(index + CONCURRENCY);
-      };
-
-      const pool = [];
-      for (let i = 0; i < Math.min(CONCURRENCY, totalFiles); i++) {
-        pool.push(uploadFile(i));
+        await uploadChunked(file, relativeDir);
+        
+        processedCount++;
+        setUploadProgress(Math.round((processedCount / totalFiles) * 100));
       }
-      await Promise.all(pool);
 
-      alert(`PASTA ENVIADA: ${uploadedCount}/${totalFiles} arquivos processados e em fila.`);
+      alert(`PASTA ENVIADA: ${processedCount}/${totalFiles} arquivos processados.`);
     } catch (err: any) {
       console.error(err);
       alert("Erro fatal no upload da pasta: " + err.message);
@@ -678,13 +671,9 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2">
-              <div className={cn(
-                "w-3 h-3 rounded-full",
-                status === 'running' ? "bg-[#38e11d] animate-pulse shadow-[0_0_10px_rgba(56,225,29,0.8)]" : 
-                status === 'stopped' ? "bg-[#ff3e3e]" : "bg-amber-500 animate-pulse"
-              )} />
+            <div className="flex items-center gap-6">
+            <div className="flex items-center gap-2 group relative">
+              <HealthDot serverStatus={status} stats={stats} />
               <span className={cn(
                 "text-xs font-bold uppercase tracking-widest",
                 status === 'running' ? "text-[#38e11d]" : 
@@ -714,7 +703,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="relative z-10 max-w-full mx-auto px-4 md:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <main className="relative z-10 max-w-full mx-auto px-4 md:px-12 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         
         {/* Left Column: Stats & Monitoring */}
         <div className="lg:col-span-8 space-y-6">
@@ -768,30 +757,38 @@ export default function App() {
                 className="space-y-6"
               >
                 {/* Main Grid Metrics */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                   <MetricCard 
-                    label="Processador" 
-                    value={stats?.cpuModel ? (stats.cpuModel.length > 12 ? stats.cpuModel.substring(0, 12) + ".." : stats.cpuModel) : "Lendo..."} 
+                    label="CPU" 
+                    value={`${stats?.cpu.usage ?? 0}%`} 
                     icon={<Cpu className="text-[#00d1ff]" size={16} />}
-                    subLabel={`Carga: ${stats?.cpuLoad || "0"}%`}
+                    subLabel={`${stats?.cpu.cores ?? 0} Cores / ${stats?.cpu.temp ?? 0}°C`}
                     color="#00d1ff"
-                    percentage={stats?.cpuLoad || "0"}
+                    percentage={stats?.cpu.usage ?? 0}
                   />
                   <MetricCard 
-                    label="Memória RAM" 
-                    value={stats?.ram ? `${stats.ram.used}/${stats.ram.total}GB` : "0/0GB"} 
+                    label="RAM" 
+                    value={`${stats?.ram.used ?? 0}/${stats?.ram.total ?? 0}GB`} 
                     icon={<Database className="text-[#38e11d]" size={16} />}
-                    subLabel={`Uso do Servidor`}
+                    subLabel={`${stats?.ram.free ?? 0}GB Livres`}
                     color="#38e11d"
-                    percentage={stats?.ram.percent || "0"}
+                    percentage={stats?.ram.percent ?? 0}
                   />
                   <MetricCard 
-                    label="Placa Gráfica" 
-                    value={stats?.gpu === "N/A" ? "Indisponível" : (stats?.gpu?.length || 0) > 12 ? stats?.gpu?.substring(0, 12) + "..." : stats?.gpu || "Lendo..."} 
+                    label="GPU" 
+                    value={stats?.gpu ? `${stats.gpu.usage}%` : "Inativa"} 
                     icon={<Activity className="text-[#bd00ff]" size={16} />}
-                    subLabel={stats?.gpuVram ? `${stats.gpuVram}MB VRAM` : "Monitorando hardware"}
+                    subLabel={stats?.gpu ? stats.gpu.name : "Monitorando..."}
                     color="#bd00ff"
-                    percentage={stats?.gpuVram ? "20" : "0"}
+                    percentage={stats?.gpu?.usage ?? 0}
+                  />
+                  <MetricCard 
+                    label="Uptime" 
+                    value={stats?.uptime ? (stats.uptime / 3600).toFixed(1) + "h" : "0.0h"} 
+                    icon={<RotateCcw className="text-amber-500" size={16} />}
+                    subLabel="Tempo Online"
+                    color="#f59e0b"
+                    percentage={Math.min((stats?.uptime || 0) / 3600, 100)}
                   />
                 </div>
 
@@ -814,7 +811,7 @@ export default function App() {
                     </div>
                   </div>
                   
-                  <div className="h-[240px] w-full relative z-10">
+                  <div className="h-[300px] w-full relative z-10">
                     <ResponsiveContainer width="100%" height="100%">
                       <AreaChart data={statsHistory}>
                         <defs>
@@ -867,7 +864,7 @@ export default function App() {
                 </div>
 
                 {/* Console Output */}
-                <div className="bg-black border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-2xl flex flex-col h-[400px]">
+                <div className="bg-black border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-2xl flex flex-col h-[500px]">
                    <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
                       <div className="flex items-center gap-2 text-slate-500">
                          <Terminal size={14} />
@@ -911,6 +908,45 @@ export default function App() {
                       </form>
                    </div>
                 </div>
+
+                {/* Audit Logs Section */}
+                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-xl">
+                  <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                       <div className="w-1 h-3 bg-amber-500 rounded-full" />
+                       <h3 className="text-xs font-black uppercase tracking-[0.2em] text-white">Auditoria de Eventos</h3>
+                    </div>
+                    <button 
+                      onClick={() => fetch('/api/admin/logs').then(res => res.json()).then(setAuditLogs)}
+                      className="text-[10px] font-bold text-slate-500 hover:text-white uppercase transition-colors"
+                    >
+                      Atualizar
+                    </button>
+                  </div>
+                  <div className="p-4 max-h-[300px] overflow-y-auto custom-scrollbar space-y-2">
+                    {auditLogs.length === 0 ? (
+                      <div className="text-center py-8 text-slate-600 text-xs italic">Nenhum evento registrado recentemente.</div>
+                    ) : (
+                      auditLogs.map((log, idx) => (
+                        <div key={idx} className="flex gap-4 p-3 bg-black/20 rounded-xl border border-white/5 hover:border-white/10 transition-colors">
+                          <div className={cn(
+                            "w-1 self-stretch rounded-full shrink-0",
+                            log.level === 'error' ? "bg-red-500" : log.level === 'warn' ? "bg-amber-500" : "bg-[#38e11d]"
+                          )} />
+                          <div className="flex-1 space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-black uppercase text-white tracking-widest">{log.message}</span>
+                              <span className="text-[8px] font-mono text-slate-500">{new Date(log.timestamp).toLocaleString()}</span>
+                            </div>
+                            {log.details && (
+                              <p className="text-[9px] text-slate-400 font-mono line-clamp-1">{JSON.stringify(log.details)}</p>
+                            )}
+                          </div>
+                        </div>
+                      )).reverse()
+                    )}
+                  </div>
+                </div>
               </motion.div>
             ) : activeTab === 'console' ? (
               <motion.div 
@@ -918,7 +954,7 @@ export default function App() {
                 initial={{ opacity: 0, x: -20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 20 }}
-                className="bg-black border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-2xl flex flex-col h-[750px]"
+                className="bg-black border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-2xl flex flex-col h-[850px]"
               >
                   <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
                     <div className="flex items-center gap-3">
@@ -1002,10 +1038,10 @@ export default function App() {
                 initial={{ opacity: 0, x: -20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 20 }}
-                className="space-y-6 pb-20"
+                className="flex flex-col gap-6 h-[calc(100vh-140px)] pt-2"
               >
-                {/* Search Header */}
-                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-8 shadow-xl relative overflow-hidden">
+                {/* Fixed Search Area */}
+                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-8 shadow-xl relative overflow-hidden shrink-0">
                   {/* Sync Indicator */}
                   <div className="absolute top-4 right-4 flex items-center gap-2">
                     {syncStatus.isSyncing && (
@@ -1028,11 +1064,10 @@ export default function App() {
                     </button>
                   </div>
 
-                  <div className="max-w-2xl mx-auto text-center space-y-4">
-                    <h2 className="text-2xl font-black text-white italic uppercase tracking-tighter">Marketplace de Modpacks</h2>
-                    <p className="text-slate-500 text-sm">Biblioteca global integrada. Explore, escolha e instale instantaneamente.</p>
+                  <div className="max-w-4xl mx-auto text-center space-y-4">
+                    <h2 className="text-3xl font-black text-white italic uppercase tracking-tighter">Marketplace de Modpacks</h2>
                     
-                    <form onSubmit={(e) => marketplaceActions.search(e, true)} className="relative mt-8 group">
+                    <form onSubmit={(e) => marketplaceActions.search(e, true)} className="relative mt-4 group">
                       <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-[#38e11d] transition-colors" size={20} />
                       <input 
                         type="text" 
@@ -1049,16 +1084,39 @@ export default function App() {
                         {isSearchingMarket ? 'Buscando...' : 'Pesquisar'}
                       </button>
                     </form>
+                  </div>
+                </div>
 
-                    {/* Filters Bar */}
-                    <div className="flex flex-wrap items-center justify-center gap-3 mt-6">
-                      <div className="flex items-center gap-2 bg-black/40 border border-[#2d2d2d] rounded-lg px-3 py-1.5">
+                <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
+                  {/* Horizontal Categories Bar - Sticky at the top of scrollable area */}
+                  <div className="sticky top-0 z-20 pb-4 pt-1 bg-[#0c0c0c]/90 backdrop-blur-md space-y-3">
+                    <div className="flex gap-3 overflow-x-auto pb-1 no-scrollbar scroll-smooth">
+                      {['Tudo', 'RPG', 'Adventure', 'Tech', 'Magic', 'Hardcore', 'Skyblock', 'Quest', 'Vanilla+', 'Cobblemon', 'Horror', 'Expert', 'Multiplayer'].map(cat => (
+                        <button 
+                          key={cat}
+                          onClick={() => {
+                            setMarketQuery(cat === 'Tudo' ? "" : cat.toLowerCase());
+                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
+                          }}
+                          className={cn(
+                            "grow shrink-0 px-6 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all border",
+                            (marketQuery === cat.toLowerCase() || (cat === 'Tudo' && marketQuery === "")) 
+                              ? "bg-[#38e11d] text-black border-[#38e11d] shadow-[0_0_15px_rgba(56,225,29,0.3)]" 
+                              : "bg-[#161616] text-slate-400 border-[#2d2d2d] hover:border-[#38e11d]/50 hover:text-white"
+                          )}
+                        >
+                          {cat}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center gap-3 overflow-x-auto no-scrollbar">
+                      <div className="flex items-center gap-2 bg-[#161616] border border-[#2d2d2d] rounded-xl px-3 py-1.5 shrink-0">
                         <span className="text-[8px] font-black uppercase text-slate-500">Versão:</span>
                         <select 
                           value={marketFilterVersion}
                           onChange={(e) => {
                             setMarketFilterVersion(e.target.value);
-                            // Initial search with new filter
                             setTimeout(() => marketplaceActions.search(undefined, true), 0);
                           }}
                           className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
@@ -1073,7 +1131,7 @@ export default function App() {
                         </select>
                       </div>
 
-                      <div className="flex items-center gap-2 bg-black/40 border border-[#2d2d2d] rounded-lg px-3 py-1.5">
+                      <div className="flex items-center gap-2 bg-[#161616] border border-[#2d2d2d] rounded-xl px-3 py-1.5 shrink-0">
                         <span className="text-[8px] font-black uppercase text-slate-500">Loader:</span>
                         <select 
                           value={marketFilterLoader}
@@ -1096,16 +1154,21 @@ export default function App() {
                           setMarketQuery("");
                           setTimeout(() => marketplaceActions.search(undefined, true), 0);
                         }}
-                        className="text-[10px] font-black uppercase text-slate-600 hover:text-white transition-colors"
+                        className="shrink-0 text-[10px] font-black uppercase text-slate-600 hover:text-white transition-colors"
                       >
-                        Resetar Filtros
+                        Resetar Tudo
                       </button>
                     </div>
                   </div>
-                </div>
 
-                {/* Results Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500">
+                      {marketQuery ? `Resultados para "${marketQuery}"` : "Explorar Todos"}
+                    </h3>
+                  </div>
+
+                  {/* Results Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
                   {marketProjects.map((project, idx) => {
                     const isLast = idx === marketProjects.length - 1;
                     return (
@@ -1129,20 +1192,20 @@ export default function App() {
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 mb-1">
                               <span className={cn(
-                                "text-[7px] font-black uppercase px-1.5 py-0.5 rounded border",
+                                "text-[8px] font-black uppercase px-2 py-0.5 rounded border",
                                 project.provider === 'modrinth' ? "text-green-400 border-green-400/20 bg-green-400/5" : "text-orange-400 border-orange-400/20 bg-orange-400/5"
                               )}>
                                 {project.provider}
                               </span>
-                              <h4 className="font-bold text-white truncate text-xs group-hover:text-[#38e11d] transition-colors">{project.title}</h4>
+                              <h4 className="font-black text-white truncate text-sm group-hover:text-[#38e11d] transition-colors tracking-tight">{project.title}</h4>
                             </div>
-                            <p className="text-[10px] text-slate-500 line-clamp-2 leading-relaxed h-8">{project.description}</p>
+                            <p className="text-xs text-slate-500 line-clamp-2 leading-relaxed h-10">{project.description}</p>
                           </div>
                         </div>
 
                         <div className="flex items-center justify-between pt-4 border-t border-white/5">
-                          <div className="flex items-center gap-3 text-[9px] font-bold text-slate-600 uppercase tracking-widest">
-                            <span className="flex items-center gap-1"><Download size={10} /> {project.downloads.toLocaleString()}</span>
+                          <div className="flex items-center gap-3 text-[10px] font-bold text-slate-600 uppercase tracking-widest">
+                            <span className="flex items-center gap-1"><Download size={12} /> {project.downloads.toLocaleString()}</span>
                           </div>
                           <div className="flex gap-1 overflow-hidden max-w-[80px]">
                             {project.loaders?.slice(0, 2).map((l: string) => (
@@ -1176,6 +1239,8 @@ export default function App() {
                    </div>
                 )}
 
+                </div>
+
                 {/* Project Details Modal */}
                 <AnimatePresence>
                   {selectedProject && (
@@ -1184,7 +1249,7 @@ export default function App() {
                          initial={{ scale: 0.95, opacity: 0, y: 20 }}
                          animate={{ scale: 1, opacity: 1, y: 0 }}
                          exit={{ scale: 0.95, opacity: 0, y: 20 }}
-                         className="bg-[#161616] border border-[#2d2d2d] rounded-3xl w-full max-w-4xl h-[85vh] flex flex-col shadow-2xl overflow-hidden"
+                         className="bg-[#161616] border border-[#2d2d2d] rounded-3xl w-full max-w-6xl h-[90vh] flex flex-col shadow-2xl overflow-hidden"
                        >
                          {/* Modal Header */}
                          <div className="p-8 border-b border-[#2d2d2d] bg-[#1a1a1a] flex gap-8">
@@ -1275,7 +1340,7 @@ export default function App() {
                 initial={{ opacity: 0, x: -20 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 20 }}
-                className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-xl flex flex-col h-[750px]"
+                className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-xl flex flex-col h-[850px]"
               >
                 <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
                    <div className="flex items-center gap-4">
@@ -1602,15 +1667,25 @@ export default function App() {
 
 function MetricCard({ label, value, icon, subLabel, color, percentage, className }: any) {
   const safePercentage = isNaN(parseFloat(percentage)) ? 0 : parseFloat(percentage);
-  
+  const isCritical = safePercentage > 85;
+
   return (
     <div className={cn(
       "bg-[#161616] p-6 rounded-2xl border border-[#2d2d2d] shadow-xl hover:bg-[#1c1c1c] transition-all group overflow-hidden relative", 
+      isCritical ? "border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]" : "",
       className
     )}>
+      {isCritical && (
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: [0, 0.05, 0] }}
+          transition={{ duration: 2, repeat: Infinity }}
+          className="absolute inset-0 bg-red-500 pointer-events-none"
+        />
+      )}
       <div className="flex justify-between items-start mb-4 relative z-10">
         <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500">{label}</span>
-        <span className="text-xs font-mono font-bold" style={{ color }}>{safePercentage.toFixed(1)}%</span>
+        <span className="text-xs font-mono font-bold" style={{ color: isCritical ? "#ef4444" : color }}>{safePercentage.toFixed(1)}%</span>
       </div>
       <div className="text-4xl font-black mb-4 italic text-white flex items-baseline gap-1 relative z-10">
         {value.includes('/') ? (
@@ -1634,6 +1709,36 @@ function MetricCard({ label, value, icon, subLabel, color, percentage, className
       {/* Decorative background icon */}
       <div className="absolute -bottom-4 -right-4 opacity-5 group-hover:opacity-10 transition-opacity">
          {React.cloneElement(icon as React.ReactElement, { size: 80 })}
+      </div>
+    </div>
+  );
+}
+
+function HealthDot({ serverStatus, stats }: { serverStatus: string, stats: any }) {
+  const isCritical = (stats?.cpu?.usage || 0) > 90 || (stats?.ram?.percent || 0) > 95;
+  const isWarning = (stats?.cpu?.usage || 0) > 75 || (stats?.ram?.percent || 0) > 85;
+
+  let color = "bg-[#38e11d]";
+  if (serverStatus === 'stopped') color = "bg-[#ff3e3e]";
+  else if (isCritical) color = "bg-red-500";
+  else if (isWarning) color = "bg-amber-500";
+  else if (serverStatus !== 'running') color = "bg-amber-500";
+
+  return (
+    <div className="relative">
+      <div className={cn(
+        "w-3 h-3 rounded-full transition-colors duration-500",
+        color,
+        (serverStatus === 'running' || serverStatus === 'starting') && "animate-pulse shadow-[0_0_10px_currentColor]"
+      )} style={{ color: color.includes('38e11d') ? '#38e11d' : color.includes('red') ? '#ef4444' : '#f59e0b' }} />
+      
+      {/* Tooltip hint */}
+      <div className="absolute top-full left-1/2 -translate-x-1/2 pt-2 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
+        <div className="bg-[#1a1a1a] border border-[#2d2d2d] rounded px-2 py-1 whitespace-nowrap shadow-2xl">
+          <p className="text-[8px] font-black uppercase text-white tracking-widest">
+            Saúde: {isCritical ? "Crítica" : isWarning ? "Pesada" : "Nominal"}
+          </p>
+        </div>
       </div>
     </div>
   );

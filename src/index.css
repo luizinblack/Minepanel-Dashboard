@@ -1,1 +1,41 @@
 @import "tailwindcss";
+
+@theme {
+  --color-brand: #38e11d;
+  --color-brand-hover: #4cf531;
+}
+
+@layer utilities {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #2d2d2d;
+    border-radius: 10px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #38e11d;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+body {
+  @apply bg-[#0c0c0c] text-[#E1E1E6];
+}
+
+/* Specific styling for scrollable containers */
+.market-scroll-container {
+  height: calc(100vh - 400px);
+  min-height: 500px;
+}

@@ -7,11 +7,26 @@ import { finished } from "stream/promises";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Standardized User-Agent to avoid blocks
+const USER_AGENT = "MineControl/1.0.0 (https://github.com/ais-dev)";
+
+/**
+ * Proxy for external API calls to keep keys safe and handle errors centrally
+ */
+const externalApi = axios.create({
+  timeout: 15000,
+  headers: {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json"
+  }
+});
+
 export async function downloadFile(url: string, dest: string, onProgress?: (percent: number) => void) {
   const { data, headers } = await axios({
     url,
     method: 'GET',
-    responseType: 'stream'
+    responseType: 'stream',
+    headers: { "User-Agent": USER_AGENT }
   });
 
   const totalLength = parseInt(String(headers['content-length'] || "0"), 10);
@@ -33,14 +48,16 @@ export async function downloadFile(url: string, dest: string, onProgress?: (perc
 
 export async function searchModrinth(query: string, limit: number = 20, offset: number = 0) {
   try {
-    const url = query 
-      ? `https://api.modrinth.com/v2/search?query=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}&facets=[["project_type:modpack"]]`
-      : `https://api.modrinth.com/v2/search?limit=${limit}&offset=${offset}&facets=[["project_type:modpack"]]`;
-      
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("Modrinth API error");
-    const data = await res.json();
-    return data.hits.map((hit: any) => ({
+    const params: any = {
+      limit,
+      offset,
+      facets: '[["project_type:modpack"]]'
+    };
+    if (query) params.query = query;
+
+    const res = await externalApi.get("https://api.modrinth.com/v2/search", { params });
+    
+    return res.data.hits.map((hit: any) => ({
       id: hit.project_id,
       slug: hit.slug,
       title: hit.title,
@@ -52,8 +69,8 @@ export async function searchModrinth(query: string, limit: number = 20, offset: 
       minecraft_versions: hit.versions || [],
       loaders: hit.categories || []
     }));
-  } catch (e) {
-    console.error("Modrinth Search Error:", e);
+  } catch (e: any) {
+    console.error(`[Proxy] Modrinth Search Error: ${e.message}`);
     return [];
   }
 }
@@ -61,27 +78,25 @@ export async function searchModrinth(query: string, limit: number = 20, offset: 
 export async function searchCurseForge(query: string, index: number = 0, pageSize: number = 20) {
   const apiKey = process.env.CURSEFORGE_API_KEY;
   if (!apiKey || apiKey === 'YOUR_KEY' || apiKey.trim() === '') {
+    console.warn("[Proxy] CurseForge API Key missing or invalid in server environment.");
     return [];
   }
 
   try {
-    const url = `https://api.curseforge.com/v1/mods/search?gameId=432&classId=4471&pageSize=${pageSize}&index=${index}${query ? `&searchFilter=${encodeURIComponent(query)}` : ''}`;
-    
-    const res = await fetch(url, {
-      headers: {
-        "x-api-key": apiKey,
-        "Accept": "application/json",
-        "User-Agent": "MineControl/1.0.0"
-      }
+    const params: any = {
+      gameId: 432,
+      classId: 4471,
+      pageSize,
+      index
+    };
+    if (query) params.searchFilter = query;
+
+    const res = await externalApi.get("https://api.curseforge.com/v1/mods/search", {
+      params,
+      headers: { "x-api-key": apiKey }
     });
     
-    if (!res.ok) {
-      console.error(`CurseForge API Error: ${res.status} ${res.statusText}`);
-      return [];
-    }
-
-    const data = await res.json();
-    return data.data.map((mod: any) => ({
+    return res.data.data.map((mod: any) => ({
       id: mod.id.toString(),
       slug: mod.slug,
       title: mod.name,
@@ -99,18 +114,16 @@ export async function searchCurseForge(query: string, index: number = 0, pageSiz
         return null;
       }).filter(Boolean)))
     }));
-  } catch (e) {
-    console.error("CurseForge Search Error:", e);
+  } catch (e: any) {
+    console.error(`[Proxy] CurseForge Search Error: ${e.message}`);
     return [];
   }
 }
 
 export async function getModrinthVersions(projectId: string) {
   try {
-    const res = await fetch(`https://api.modrinth.com/v2/project/${projectId}/version`);
-    if (!res.ok) throw new Error("Modrinth Versions API error");
-    const data = await res.json();
-    return data.map((v: any) => ({
+    const res = await externalApi.get(`https://api.modrinth.com/v2/project/${projectId}/version`);
+    return res.data.map((v: any) => ({
       id: v.id,
       name: v.name,
       version_number: v.version_number,
@@ -122,8 +135,8 @@ export async function getModrinthVersions(projectId: string) {
         primary: f.primary
       }))
     }));
-  } catch (e) {
-    console.error("Modrinth Versions Error:", e);
+  } catch (e: any) {
+    console.error(`[Proxy] Modrinth Versions Error: ${e.message}`);
     return [];
   }
 }
@@ -133,16 +146,10 @@ export async function getCurseForgeVersions(modId: string) {
   if (!apiKey) return [];
 
   try {
-    const res = await fetch(`https://api.curseforge.com/v1/mods/${modId}/files`, {
-      headers: {
-        "x-api-key": apiKey,
-        "Accept": "application/json",
-        "User-Agent": "MineControl/1.0.0"
-      }
+    const res = await externalApi.get(`https://api.curseforge.com/v1/mods/${modId}/files`, {
+      headers: { "x-api-key": apiKey }
     });
-    if (!res.ok) throw new Error("CurseForge Files API error");
-    const data = await res.json();
-    return data.data.map((f: any) => ({
+    return res.data.data.map((f: any) => ({
       id: f.id.toString(),
       name: f.displayName,
       version_number: f.fileName,
@@ -150,8 +157,8 @@ export async function getCurseForgeVersions(modId: string) {
       loaders: [],
       download_url: f.downloadUrl
     }));
-  } catch (e) {
-    console.error("CurseForge Files Error:", e);
+  } catch (e: any) {
+    console.error(`[Proxy] CurseForge Versions Error: ${e.message}`);
     return [];
   }
 }
