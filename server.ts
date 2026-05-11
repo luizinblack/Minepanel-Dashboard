@@ -135,6 +135,7 @@ async function startServer() {
     max: 1000,
     message: { error: "Muitas requisições, tente novamente mais tarde." },
     validate: { trustProxy: false },
+    skip: (req) => req.path.startsWith("/api/admin/upload")
   });
 
   const uploadLimiter = rateLimit({
@@ -144,12 +145,13 @@ async function startServer() {
     validate: { trustProxy: false },
   });
 
-  // Apply general limiter to all API routes
+  // Apply general limiter to all API routes except upload
   app.use("/api/", limiter);
 
-  // Override with more permissive limiter for upload routes
-  app.use("/api/admin/upload/", uploadLimiter);
+  // Apply permissive limiter to upload routes
+  app.use("/api/admin/upload", uploadLimiter);
   app.use("/api/admin/upload/status", uploadLimiter);
+  app.use("/api/admin/upload/chunk", uploadLimiter);
 
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
@@ -639,7 +641,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/admin/upload", authenticateToken, checkLimits, standardizedUpload.single("file"), (req: any, res) => {
+  app.post("/api/admin/upload", checkLimits, standardizedUpload.single("file"), (req: any, res) => {
     if (!req.file) return res.status(400).json({ error: "Nenhum arquivo enviado" });
 
     const metadata = {
@@ -713,7 +715,7 @@ async function startServer() {
   // Chunked Upload System
   const getChunkDir = (fileId: string) => path.join(CHUNKS_TEMP_DIR, fileId);
 
-  app.get("/api/admin/upload/status", authenticateToken, (req, res) => {
+  app.get("/api/admin/upload/status", checkLimits, (req, res) => {
     const { fileId } = req.query;
     if (!fileId) return res.status(400).json({ error: "fileId is required" });
 
@@ -735,7 +737,7 @@ async function startServer() {
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB per chunk
   });
 
-  app.post("/api/admin/upload/chunk", authenticateToken, checkLimits, chunkUpload.single("chunk"), async (req: any, res) => {
+  app.post("/api/admin/upload/chunk", checkLimits, chunkUpload.single("chunk"), async (req: any, res) => {
     const { fileId, index, total, fileName } = req.body;
     if (!req.file || !fileId || index === undefined || !total) {
       return res.status(400).json({ error: "Missing required chunk data" });

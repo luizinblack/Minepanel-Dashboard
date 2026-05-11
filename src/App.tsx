@@ -194,23 +194,50 @@ export default function App() {
   }, [activeTab, currentPath]);
 
   useEffect(() => {
-    // Initial status fetch
-    const fetchMinimalStatus = async () => {
+    // Initial status fetch + jobs + audit logs (Centralized)
+    const fetchInitialData = async () => {
+      if (isUploading) return;
       try {
-        const res = await fetch('/api/status');
-        if (res.ok) {
-          const data = await res.json();
-          setStatus(data.status);
-          setCurrentJar(data.jar);
-          setAvailableJars(data.availableJars);
-          setHasScript(data.hasScript);
+        const token = localStorage.getItem('minecontrol_token');
+        const authHeader = (token && token !== "null") ? { 'Authorization': `Bearer ${token}` } : {};
+
+        const [statusRes, jobsRes, logsRes, auditRes] = await Promise.all([
+          fetch('/api/status'),
+          fetch('/api/jobs'),
+          fetch('/api/logs'),
+          fetch('/api/admin/logs', { headers: authHeader as any })
+        ]);
+        
+        if (statusRes.ok) {
+          const statusData = await statusRes.json();
+          setStatus(statusData.status);
+          setCurrentJar(statusData.jar);
+          setAvailableJars(statusData.availableJars);
+          setHasScript(statusData.hasScript);
+        }
+        
+        if (jobsRes.ok) {
+          const jobsData = await jobsRes.json();
+          if (Array.isArray(jobsData)) setJobs(jobsData);
+        }
+
+        if (logsRes.ok) {
+          const logsData = await logsRes.json();
+          if (logsData.content) {
+            setLogs(logsData.content.split('\n').filter((l: string) => l.length > 0));
+          }
+        }
+
+        if (auditRes.ok) {
+          const auditData = await auditRes.json();
+          setAuditLogs(Array.isArray(auditData) ? auditData : []);
         }
       } catch (e) {
-        console.warn("API status fetch failed");
+        console.warn("Initial data fetch failed");
       }
     };
 
-    fetchMinimalStatus();
+    fetchInitialData();
 
     socket.on('system_metrics', (newMetrics: SystemStats) => {
       setStats(newMetrics);
@@ -248,59 +275,9 @@ export default function App() {
     });
 
     socket.on('refresh_data', () => {
-      fetchMinimalStatus();
+      fetchInitialData();
       fetchFiles(currentPath);
-      fetch('/api/admin/logs')
-        .then(res => res.json())
-        .then(data => Array.isArray(data) ? setAuditLogs(data) : setAuditLogs([]))
-        .catch(() => setAuditLogs([]));
     });
-
-    // Removed redundant Initial audit logs fetch (centralized in fetchInitialData)
-
-    // Initial data fetch
-    const fetchInitialData = async () => {
-      if (isUploading) return;
-      try {
-        const [statusRes, jobsRes, logsRes, auditRes] = await Promise.all([
-          fetch('/api/status'),
-          fetch('/api/jobs'),
-          fetch('/api/logs'),
-          fetch('/api/admin/logs', {
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
-          })
-        ]);
-        
-        if (statusRes.ok) {
-          const statusData = await statusRes.json();
-          setStatus(statusData.status);
-          setCurrentJar(statusData.jar);
-          setAvailableJars(statusData.availableJars);
-          setHasScript(statusData.hasScript);
-        }
-        
-        if (jobsRes.ok) {
-          const jobsData = await jobsRes.json();
-          if (Array.isArray(jobsData)) setJobs(jobsData);
-        }
-
-        if (logsRes.ok) {
-          const logsData = await logsRes.json();
-          if (logsData.content) {
-            setLogs(logsData.content.split('\n').filter((l: string) => l.length > 0));
-          }
-        }
-
-        if (auditRes.ok) {
-          const auditData = await auditRes.json();
-          setAuditLogs(Array.isArray(auditData) ? auditData : []);
-        }
-      } catch (e) {
-        console.warn("Initial data fetch failed");
-      }
-    };
-
-    fetchInitialData();
 
     return () => {
       socket.off('system_metrics');
@@ -393,7 +370,8 @@ export default function App() {
       } = options;
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-      const headers: any = { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` };
+      const token = localStorage.getItem('minecontrol_token');
+      const headers: any = (token && token !== "null") ? { 'Authorization': `Bearer ${token}` } : {};
 
       // 1. Check status (Resume support)
       const statusRes = await fetch(`/api/admin/upload/status?fileId=${encodeURIComponent(fileId)}`, { headers });
