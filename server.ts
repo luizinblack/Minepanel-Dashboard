@@ -40,11 +40,18 @@ const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 const UPLOADS_DIR = path.join(__dirname, "server_files");
+const LOGS_DIR = path.join(__dirname, "logs");
+const LATEST_LOG_PATH = path.join(LOGS_DIR, "latest.log");
 
-// Ensure uploads directory exists
+// Ensure directories exist
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR);
 }
+if (!fs.existsSync(LOGS_DIR)) {
+  fs.mkdirSync(LOGS_DIR);
+}
+// Clear latest log on startup
+fs.writeFileSync(LATEST_LOG_PATH, `--- MineControl Log Started at ${new Date().toLocaleString()} ---\n`);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -85,12 +92,15 @@ async function startServer() {
     });
   };
 
-  const updateJob = (jobId: string, updates: Partial<ServerJob>) => {
-    const jobIndex = jobs.findIndex(j => j.id === jobId);
-    if (jobIndex !== -1) {
-      jobs[jobIndex] = { ...jobs[jobIndex], ...updates };
-      io.emit("job_update", jobs[jobIndex]);
-    }
+  const appendToLog = (data: string) => {
+    fs.appendFileSync(LATEST_LOG_PATH, data);
+  };
+
+  const logToConsole = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    const formatted = `[${timestamp}] ${message}\n`;
+    appendToLog(formatted);
+    io.emit("console_log", formatted);
   };
 
   const processQueue = async () => {
@@ -104,7 +114,7 @@ async function startServer() {
       console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
       try {
         updateJob(job.id, { status: "EXTRACTING" });
-        io.emit("console_log", `[MineControl] Worker: Extraindo ${job.filename}...`);
+        logToConsole(`[MineControl] Worker: Extraindo ${job.filename}...`);
 
         if (job.filename.endsWith('.zip')) {
           await fs.createReadStream(job.filePath)
@@ -118,7 +128,7 @@ async function startServer() {
         }
 
         updateJob(job.id, { status: "DONE" });
-        io.emit("console_log", `[MineControl] Worker: Job ${job.id} finalizado.`);
+        logToConsole(`[MineControl] Worker: Job ${job.id} finalizado.`);
 
         // Refresh JAR detection
         const filesAfter = fs.readdirSync(UPLOADS_DIR);
@@ -130,7 +140,7 @@ async function startServer() {
       } catch (err: any) {
         console.error(`[WORKER ERROR] Job ${job.id}:`, err);
         updateJob(job.id, { status: "FAILED", error: err.message });
-        io.emit("console_log", `[MineControl] Worker: Falha no Job ${job.id} - ${err.message}`);
+        logToConsole(`[MineControl] Worker: Falha no Job ${job.id} - ${err.message}`);
       }
     }
 
@@ -173,26 +183,38 @@ async function startServer() {
     try {
       serverStatus = "starting";
       io.emit("status_change", { status: serverStatus });
-      io.emit("console_log", `[MineControl] Iniciando via script: ${script}...`);
+      logToConsole(`[MineControl] Iniciando via script: ${script}...`);
 
-      const isBat = script.endsWith('.bat');
+      const scriptPath = path.join(UPLOADS_DIR, script);
+      const isWindows = os.platform() === "win32";
       
-      // No Linux/Sandbox, tentamos rodar o .bat como shell se possível ou usamos o interpretador correto
-      const command = isBat ? "sh" : "sh"; // Em ambientes Linux, usamos sh. Se for Windows local real, seria cmd.exe
-      const args = [script];
+      // Determine correct command and arguments based on OS and file type
+      let command = "";
+      let args: string[] = [];
 
-      // Se for Linux, garantimos permissão de execução
-      if (process.platform !== 'win32') {
-        try { fs.chmodSync(path.join(UPLOADS_DIR, script), '755'); } catch(e) {}
+      if (isWindows) {
+        if (script.endsWith(".bat")) {
+          command = "cmd.exe";
+          args = ["/c", script];
+        } else {
+          command = "bash"; // Try bash if available on Windows (git bash/WSL)
+          args = [script];
+        }
+      } else {
+        // Linux/Unix environment
+        try { fs.chmodSync(scriptPath, '755'); } catch(e) {}
+        command = script.endsWith(".sh") ? "bash" : "sh";
+        args = [script];
       }
 
       minecraftProcess = spawn(command, args, {
         cwd: UPLOADS_DIR,
-        shell: true // Crucial para arquivos de lote/scripts
+        shell: isWindows // Only use shell: true on Windows for cmd.exe
       });
 
       minecraftProcess.stdout?.on("data", (data) => {
         const output = data.toString();
+        appendToLog(output);
         io.emit("console_log", output);
         if (output.includes("Done") || output.includes("For help, type \"help\"")) {
           serverStatus = "running";
@@ -201,11 +223,13 @@ async function startServer() {
       });
 
       minecraftProcess.stderr?.on("data", (data) => {
-        io.emit("console_log", `[ERROR] ${data.toString()}`);
+        const output = `[ERROR] ${data.toString()}`;
+        appendToLog(output);
+        io.emit("console_log", output);
       });
 
       minecraftProcess.on("close", (code) => {
-        io.emit("console_log", `[MineControl] Server stopped with code ${code}`);
+        logToConsole(`[MineControl] Server stopped with code ${code}`);
         minecraftProcess = null;
         serverStatus = "stopped";
         io.emit("status_change", { status: serverStatus });
@@ -227,7 +251,7 @@ async function startServer() {
 
     serverStatus = "stopping";
     io.emit("status_change", { status: serverStatus });
-    io.emit("console_log", "[MineControl] Sending stop command...");
+    logToConsole("[MineControl] Sending stop command...");
     
     minecraftProcess.stdin?.write("stop\n");
     
@@ -500,6 +524,24 @@ async function startServer() {
 
   app.get("/api/jobs", (req, res) => {
     res.json(jobs.slice(-10)); // return last 10 jobs
+  });
+
+  app.get("/api/logs", (req, res) => {
+    try {
+      const content = fs.readFileSync(LATEST_LOG_PATH, 'utf-8');
+      res.json({ content });
+    } catch (e) {
+      res.status(500).json({ error: "Could not read logs" });
+    }
+  });
+
+  app.post("/api/logs/clear", (req, res) => {
+    try {
+      fs.writeFileSync(LATEST_LOG_PATH, `--- Log Cleared at ${new Date().toLocaleString()} ---\n`);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: "Could not clear logs" });
+    }
   });
 
   // Socket.io stats broadcasting

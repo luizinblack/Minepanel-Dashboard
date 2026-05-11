@@ -21,7 +21,10 @@ import {
   Save,
   PackageOpen,
   Archive,
-  X
+  X,
+  Download,
+  ScrollText,
+  RotateCcw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -84,7 +87,7 @@ export default function App() {
   const [currentJar, setCurrentJar] = useState<string>("");
   const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'monitor' | 'files'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console'>('monitor');
   const [currentPath, setCurrentPath] = useState<string>(".");
   const [fileList, setFileList] = useState<any[]>([]);
   const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
@@ -193,6 +196,15 @@ export default function App() {
         if (jobsRes.ok) {
           const jobsData = await jobsRes.json();
           setJobs(jobsData);
+        }
+
+        // Fetch initial logs
+        const logsRes = await fetch('/api/logs');
+        if (logsRes.ok) {
+          const logsData = await logsRes.json();
+          if (logsData.content) {
+            setLogs(logsData.content.split('\n').filter((l: string) => l.length > 0));
+          }
         }
       } catch (e) {
         console.warn("Initial data fetch failed");
@@ -408,6 +420,27 @@ export default function App() {
     }
   };
 
+  const clearLogs = async () => {
+    try {
+      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      if (res.ok) {
+        setLogs([]);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const downloadLogs = () => {
+    const element = document.createElement("a");
+    const file = new Blob([logs.join('\n')], { type: 'text/plain' });
+    element.href = URL.createObjectURL(file);
+    element.download = "server_latest.log";
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-[#E1E1E6] font-sans selection:bg-[#38e11d]/30">
       {/* Grid Pattern Overlay */}
@@ -486,6 +519,15 @@ export default function App() {
               )}
             >
               Arquivos do Servidor
+            </button>
+            <button 
+              onClick={() => setActiveTab('console')}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all",
+                activeTab === 'console' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+              )}
+            >
+              Console do Servidor
             </button>
           </div>
 
@@ -602,12 +644,20 @@ export default function App() {
                    <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
                       <div className="flex items-center gap-2 text-slate-500">
                          <Terminal size={14} />
-                         <span className="text-[10px] font-black uppercase tracking-[0.2em]">Console do Servidor</span>
+                         <span className="text-[10px] font-black uppercase tracking-[0.2em]">Live Output</span>
                       </div>
-                      <div className="flex gap-1.5">
-                         <div className="w-2 h-2 rounded-full bg-[#ff3e3e]/30" />
-                         <div className="w-2 h-2 rounded-full bg-amber-500/30" />
-                         <div className="w-2 h-2 rounded-full bg-[#38e11d]/30" />
+                      <div className="flex items-center gap-2">
+                        <button 
+                          onClick={() => setActiveTab('console')}
+                          className="px-3 py-1 bg-white/5 hover:bg-white/10 rounded-md text-[9px] font-bold uppercase tracking-wider text-slate-400"
+                        >
+                          Tela Cheia
+                        </button>
+                         <div className="flex gap-1.5 ml-2">
+                            <div className="w-2 h-2 rounded-full bg-[#ff3e3e]/30" />
+                            <div className="w-2 h-2 rounded-full bg-amber-500/30" />
+                            <div className="w-2 h-2 rounded-full bg-[#38e11d]/30" />
+                         </div>
                       </div>
                    </div>
                    <div className="p-6 font-mono text-sm overflow-y-auto flex-1 custom-scrollbar text-green-400 opacity-80">
@@ -634,6 +684,90 @@ export default function App() {
                       </form>
                    </div>
                 </div>
+              </motion.div>
+            ) : activeTab === 'console' ? (
+              <motion.div 
+                key="console"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                className="bg-black border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-2xl flex flex-col h-[750px]"
+              >
+                  <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <Terminal size={18} className="text-[#38e11d]" />
+                        <h2 className="text-sm font-black text-white italic uppercase tracking-wider">Interface de Comando Terminal</h2>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <button 
+                        onClick={downloadLogs}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-white/5 hover:bg-white/10 text-white rounded-lg text-[10px] font-black uppercase transition-all"
+                      >
+                        <Download size={14} /> Baixar Logs
+                      </button>
+                      <button 
+                        onClick={clearLogs}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-500 rounded-lg text-[10px] font-black uppercase transition-all"
+                      >
+                        <RotateCcw size={14} /> Limpar
+                      </button>
+                    </div>
+                  </div>
+                  
+                  <div className="p-8 font-mono text-sm overflow-y-auto flex-1 custom-scrollbar bg-black/60">
+                    <div className="max-w-4xl mx-auto space-y-1">
+                      {logs.length === 0 && <div className="text-slate-700 italic border-l-2 border-slate-800 pl-4 py-2">Sem atividade no log no momento...</div>}
+                      {logs.map((log, i) => {
+                        const isError = log.includes('[ERROR]') || log.toLowerCase().includes('error') || log.toLowerCase().includes('fail');
+                        const isWarn = log.toLowerCase().includes('warn');
+                        const isInfo = log.includes('[MineControl]');
+                        
+                        return (
+                          <div key={i} className={cn(
+                            "group flex gap-4 py-0.5 border-l-2 whitespace-pre-wrap transition-colors",
+                            isError ? "border-red-500/50 bg-red-500/5" : 
+                            isWarn ? "border-amber-500/50 bg-amber-500/5" :
+                            isInfo ? "border-[#38e11d]/50 bg-[#38e11d]/5" :
+                            "border-transparent hover:bg-white/5"
+                          )}>
+                            <span className="text-[10px] text-slate-700 shrink-0 select-none w-20 text-right opacity-30 group-hover:opacity-100 italic">
+                              {(i + 1).toString().padStart(4, '0')}
+                            </span>
+                            <span className={cn(
+                              "flex-1",
+                              isError ? "text-red-400" : 
+                              isWarn ? "text-amber-400" :
+                              isInfo ? "text-indigo-400 font-bold" :
+                              "text-green-400/80"
+                            )}>
+                              {log}
+                            </span>
+                          </div>
+                        );
+                      })}
+                      <div ref={consoleEndRef} />
+                    </div>
+                  </div>
+
+                  <div className="px-8 py-6 bg-[#0a0a0a] border-t border-[#2d2d2d] flex gap-4 items-center">
+                    <div className="flex h-10 w-10 items-center justify-center bg-[#38e11d]/10 rounded-lg border border-[#38e11d]/20">
+                      <span className="text-[#38e11d] font-black text-xl select-none">$</span>
+                    </div>
+                    <form onSubmit={sendCommand} className="flex-1">
+                      <input 
+                        type="text" 
+                        className="bg-transparent border-none outline-none w-full text-white font-mono text-base placeholder:text-slate-700" 
+                        placeholder="Insira um comando direto para o runtime do servidor..."
+                        autoFocus
+                        disabled={status !== 'running'}
+                        value={command}
+                        onChange={(e) => setCommand(e.target.value)}
+                      />
+                    </form>
+                    <div className="text-[10px] text-slate-600 font-bold uppercase tracking-widest hidden md:block">
+                      Pressione ENTER para enviar
+                    </div>
+                  </div>
               </motion.div>
             ) : (
               <motion.div 
