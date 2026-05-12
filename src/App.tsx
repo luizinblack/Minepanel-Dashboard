@@ -1,619 +1,361 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
+  Server, 
   Terminal, 
-  Files, 
-  Box, 
+  Upload, 
   Settings, 
   Power, 
-  RotateCcw, 
-  StopCircle, 
-  Cpu, 
+  Activity, 
+  Shield, 
   Database, 
-  Network, 
-  Users, 
-  Search, 
-  Download, 
-  Trash2, 
-  Folder, 
-  FileText, 
-  ChevronRight,
+  Plus, 
   HardDrive,
-  Activity,
-  ShieldCheck,
-  LayoutDashboard,
-  Menu,
-  X,
-  Bell,
-  User,
-  Plus
+  Box,
+  ChevronRight,
+  Monitor,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  FolderOpen,
+  Users
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  LineChart, 
-  Line, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer,
-  AreaChart,
-  Area
-} from 'recharts';
+import { motion, AnimatePresence } from 'motion/react';
+import axios from 'axios';
 
-// --- Tipos & Interfaces ---
+// --- Types ---
 
-type ServerStatus = 'online' | 'offline' | 'starting' | 'stopping' | 'hidden';
-
-interface ConsoleLine {
-  id: string;
-  timestamp: string;
-  message: string;
-  type: 'info' | 'error' | 'warn' | 'success' | 'command';
-}
-
-interface FileItem {
-  name: string;
-  type: 'file' | 'directory';
-  size: string;
-  modified: string;
-}
-
-interface Modpack {
+interface ServerData {
   id: string;
   name: string;
-  version: string;
-  vendor: string;
-  downloads: string;
-  logo: string;
+  status: 'online' | 'offline' | 'starting';
+  ram: string;
+  players: string;
 }
 
-// --- Dados de Exemplo ---
-
-const MOCK_FILES: FileItem[] = [
-  { name: 'mods', type: 'directory', size: '--', modified: '12/05/2026 14:30' },
-  { name: 'world', type: 'directory', size: '--', modified: '12/05/2026 18:21' },
-  { name: 'config', type: 'directory', size: '--', modified: '11/05/2026 09:15' },
-  { name: 'server.properties', type: 'file', size: '2.4 KB', modified: '12/05/2026 10:00' },
-  { name: 'eula.txt', type: 'file', size: '0.1 KB', modified: '10/05/2026 11:00' },
-  { name: 'ops.json', type: 'file', size: '0.4 KB', modified: '12/05/2026 17:45' },
-  { name: 'whitelist.json', type: 'file', size: '0.2 KB', modified: '01/05/2026 12:00' },
-  { name: 'forge-1.20.1.jar', type: 'file', size: '42.5 MB', modified: '05/05/2026 20:30' },
-];
-
-const MOCK_MODPACKS: Modpack[] = [
-  { id: '1', name: 'Better Minecraft', version: 'v25', vendor: 'Forge', downloads: '1.2M', logo: 'https://media.forgecdn.net/avatars/402/894/637604470129206627.png' },
-  { id: '2', name: 'All the Mods 9', version: 'v1.4.2', vendor: 'Forge', downloads: '850K', logo: 'https://media.forgecdn.net/avatars/615/656/637953284074213794.png' },
-  { id: '3', name: 'RLCraft', version: 'v2.9.3', vendor: 'Forge', downloads: '3.4M', logo: 'https://media.forgecdn.net/avatars/158/899/636662491104648753.png' },
-  { id: '4', name: 'SkyFactory 4', version: 'v4.2.4', vendor: 'Forge', downloads: '2.8M', logo: 'https://media.forgecdn.net/avatars/200/524/636906209867905814.png' },
-];
-
-// --- Sub-componentes ---
-
-const MetricCard = ({ icon: Icon, label, value, subtext, color }: any) => (
-  <div className="bg-[#1a1a1a] border border-white/5 p-4 rounded-xl space-y-3">
-    <div className="flex items-center justify-between">
-      <div className={`p-2 rounded-lg bg-${color}-500/10 text-${color}-500`}>
-        <Icon size={20} />
-      </div>
-      <div className="text-[10px] uppercase tracking-wider text-white/40 font-mono">Real-time</div>
-    </div>
-    <div>
-      <div className="text-2xl font-mono font-medium text-white">{value}</div>
-      <div className="text-xs text-white/50 flex items-center gap-1">
-        {label} <span className="text-[10px] opacity-30">•</span> {subtext}
-      </div>
-    </div>
-  </div>
-);
-
-// --- Componente Principal ---
+// --- Main App ---
 
 export default function App() {
-  const [status, setStatus] = useState<ServerStatus>('online');
-  const [activeTab, setActiveTab] = useState<'console' | 'files' | 'modpacks' | 'backups' | 'settings'>('console');
-  const [consoleOutput, setConsoleOutput] = useState<ConsoleLine[]>([]);
-  const [command, setCommand] = useState('');
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [servers, setServers] = useState<ServerData[]>([]);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'files' | 'settings'>('dashboard');
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
 
-  // Simular métricas (CPU/RAM)
-  const [metricsData, setMetricsData] = useState<any[]>([]);
-
+  // Load servers on mount
   useEffect(() => {
-    // Gerar dados iniciais do gráfico
-    const initial = Array.from({ length: 20 }, (_, i) => ({
-      time: i,
-      cpu: Math.floor(Math.random() * 40) + 10,
-      ram: Math.floor(Math.random() * 20) + 60,
-    }));
-    setMetricsData(initial);
-
-    // Atualizar métricas a cada 3s
-    const interval = setInterval(() => {
-      setMetricsData(prev => {
-        const next = [...prev.slice(1), {
-          time: prev[prev.length - 1].time + 1,
-          cpu: Math.floor(Math.random() * 40) + 10,
-          ram: Math.floor(Math.random() * 20) + 60,
-        }];
-        return next;
-      });
-    }, 3000);
-
-    return () => clearInterval(interval);
+    fetchServers();
   }, []);
 
-  // Simular logs de console aleatórios
-  useEffect(() => {
-    const messages = [
-      '[Server thread/INFO]: Player JohnDoe joined the game',
-      '[Server thread/INFO]: जॉन joined the game',
-      '[Server thread/WARN]: Can\'t keep up! Is the server overloaded?',
-      '[Server thread/INFO]: JohnDoe issued server command: /tps',
-      '[Server thread/INFO]: TPM in world "world" is 20.0 (100%)',
-      '[Server thread/INFO]: Chunk saved in 45ms',
-    ];
-
-    const logInterval = setInterval(() => {
-      if (status === 'online') {
-        const msg = messages[Math.floor(Math.random() * messages.length)];
-        addLog(msg);
-      }
-    }, 8000);
-
-    return () => clearInterval(logInterval);
-  }, [status]);
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [consoleOutput]);
-
-  const addLog = (message: string, type: ConsoleLine['type'] = 'info') => {
-    const newLine: ConsoleLine = {
-      id: Math.random().toString(36).substr(2, 9),
-      timestamp: new Date().toLocaleTimeString('pt-BR', { hour12: false }),
-      message,
-      type
-    };
-    setConsoleOutput(prev => [...prev.slice(-100), newLine]);
-  };
-
-  const handleCommand = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!command.trim()) return;
-    addLog(`> ${command}`, 'command');
-    setCommand('');
-    
-    // Simular resposta a comandos
-    if (command.toLowerCase() === 'help') {
-      addLog('Comandos disponíveis: help, tps, list, stop, say', 'success');
-    } else if (command.toLowerCase() === 'tps') {
-      addLog('TPS from last 1m, 5m, 15m: 20.0, 19.98, 19.95', 'info');
+  const fetchServers = async () => {
+    try {
+      const res = await axios.get('/api/servers');
+      const formatted = res.data.map((s: any) => ({
+        ...s,
+        status: 'offline', // Default for simulation
+        ram: '0/2GB',
+        players: '0/20'
+      }));
+      setServers(formatted);
+    } catch (err) {
+      console.error("Erro ao carregar servidores", err);
     }
   };
 
-  const togglePower = () => {
-    if (status === 'online') {
-      setStatus('stopping');
-      addLog('Enviando sinal de encerramento...', 'warn');
+  const handleUpload = async () => {
+    if (!file) return;
+    setIsUploading(true);
+    const form = new FormData();
+    form.append('file', file);
+
+    try {
+      const res = await axios.post('/api/upload', form);
+      alert(`Servidor criado com ID: ${res.data.serverId}`);
+      setFile(null);
+      fetchServers();
+    } catch (err) {
+      alert("Falha no upload");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const startServer = async (id: string) => {
+    try {
+      setServers(prev => prev.map(s => s.id === id ? { ...s, status: 'starting' } : s));
+      await axios.post(`/api/start/${id}`);
+      // Simulate startup delay
       setTimeout(() => {
-        setStatus('offline');
-        addLog('Servidor desligado com sucesso.', 'error');
+        setServers(prev => prev.map(s => s.id === id ? { ...s, status: 'online' } : s));
       }, 3000);
-    } else if (status === 'offline') {
-      setStatus('starting');
-      addLog('Iniciando servidor Forge 1.20.1...', 'info');
-      setTimeout(() => {
-        setStatus('online');
-        addLog('Servidor pronto e ouvindo na porta 25565!', 'success');
-      }, 5000);
+    } catch (err) {
+      alert("Falha ao iniciar servidor");
+    }
+  };
+
+  const stopServer = async (id: string) => {
+    try {
+      await axios.post(`/api/stop/${id}`);
+      setServers(prev => prev.map(s => s.id === id ? { ...s, status: 'offline' } : s));
+    } catch (err) {
+      alert("Falha ao parar servidor");
     }
   };
 
   return (
-    <div className="flex h-screen bg-[#0f0f0f] text-white overflow-hidden font-sans selection:bg-orange-500/30">
-      
-      {/* Sidebar */}
-      <motion.aside 
-        initial={false}
-        animate={{ width: isSidebarOpen ? 260 : 80 }}
-        className="bg-[#141414] border-r border-white/5 flex flex-col z-20"
-      >
-        <div className="p-6 flex items-center gap-3">
-          <div className="w-8 h-8 bg-orange-600 rounded flex items-center justify-center shrink-0 shadow-lg shadow-orange-900/20">
-            <LayoutDashboard size={18} className="text-white" />
-          </div>
-          {isSidebarOpen && (
-            <motion.span 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="font-bold text-lg tracking-tight"
-            >
-              MinePanel <span className="text-orange-500">Pro</span>
-            </motion.span>
-          )}
-        </div>
+    <div className="min-h-screen bg-[#09090b] text-zinc-400 font-sans selection:bg-emerald-500/30">
+      {/* Background Glow */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[-5%] right-[-5%] w-[600px] h-[600px] bg-emerald-500/5 rounded-full blur-[120px]" />
+        <div className="absolute bottom-[-5%] left-[-5%] w-[500px] h-[500px] bg-indigo-600/5 rounded-full blur-[100px]" />
+      </div>
 
-        <nav className="flex-1 px-3 space-y-1 mt-4">
-          <NavItem active={activeTab === 'console'} onClick={() => setActiveTab('console')} icon={Terminal} label="Console" collapsed={!isSidebarOpen} />
-          <NavItem active={activeTab === 'files'} onClick={() => setActiveTab('files')} icon={Files} label="Arquivos" collapsed={!isSidebarOpen} />
-          <NavItem active={activeTab === 'modpacks'} onClick={() => setActiveTab('modpacks')} icon={Box} label="Modpacks" collapsed={!isSidebarOpen} />
-          <NavItem active={activeTab === 'backups'} onClick={() => setActiveTab('backups')} icon={RotateCcw} label="Backups" collapsed={!isSidebarOpen} />
-          <NavItem active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={Settings} label="Configurações" collapsed={!isSidebarOpen} />
-        </nav>
-
-        <div className="p-4 border-t border-white/5">
-          <div className="flex items-center gap-3 px-2">
-            <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center border border-white/10 overflow-hidden">
-              <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Admin" alt="avatar" />
+      <div className="relative flex min-h-screen">
+        {/* Sidebar */}
+        <aside className="w-64 border-r border-zinc-800 bg-zinc-950/50 backdrop-blur-xl flex flex-col p-6 sticky top-0 h-screen">
+          <div className="flex items-center gap-3 mb-10 px-2">
+            <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center shadow-lg shadow-emerald-500/20">
+              <Box className="text-zinc-950" size={18} />
             </div>
-            {isSidebarOpen && (
-              <div className="flex-1 overflow-hidden">
-                <div className="text-sm font-medium truncate">Master Admin</div>
-                <div className="text-[10px] text-white/40 uppercase tracking-widest font-mono">Plano Diamond</div>
+            <h1 className="text-lg font-black text-white italic uppercase tracking-tighter">
+              Mine<span className="text-emerald-500">Panel</span>
+            </h1>
+          </div>
+
+          <nav className="flex-1 space-y-1">
+            <SidebarLink active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} icon={Server} label="Servidores" />
+            <SidebarLink active={activeTab === 'files'} onClick={() => setActiveTab('files')} icon={FolderOpen} label="Arquivos" />
+            <SidebarLink active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={Settings} label="Ajustes" />
+          </nav>
+
+          <div className="mt-auto pt-6 border-t border-zinc-800">
+            <div className="flex items-center gap-3 px-2">
+              <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700 overflow-hidden">
+                <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Admin" alt="avatar" />
               </div>
-            )}
-          </div>
-        </div>
-      </motion.aside>
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0">
-        
-        {/* Header */}
-        <header className="h-16 border-b border-white/5 bg-[#141414]/50 backdrop-blur-md flex items-center justify-between px-8 z-10">
-          <div className="flex items-center gap-6">
-            <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-white/5 rounded-lg transition-colors text-white/60">
-              <Menu size={20} />
-            </button>
-            <div className="flex items-center gap-2">
-              <span className="text-white/40 text-sm">Meu Servidor</span>
-              <ChevronRight size={14} className="text-white/20" />
-              <span className="text-sm font-medium">Survival SMP</span>
+              <div className="flex-1 overflow-hidden">
+                <p className="text-sm font-bold text-white truncate">Administrator</p>
+                <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-black">VPS Master</p>
+              </div>
             </div>
           </div>
+        </aside>
 
-          <div className="flex items-center gap-4">
-            <div className="hidden md:flex items-center gap-3 px-4 py-1.5 bg-[#1a1a1a] border border-white/5 rounded-full">
-              <div className={`w-2 h-2 rounded-full ${
-                status === 'online' ? 'bg-green-500 animate-pulse' : 
-                status === 'starting' ? 'bg-yellow-500 animate-pulse' : 
-                'bg-red-500'
-              }`} />
-              <span className="text-xs font-medium uppercase tracking-wider text-white/80">
-                {status === 'online' ? 'Servidor Online' : 
-                 status === 'offline' ? 'Fora do Ar' : 
-                 status === 'starting' ? 'Iniciando...' : 'Desligando...'}
-              </span>
-            </div>
-            
-            <div className="flex items-center gap-2 border-l border-white/10 pl-4 ml-2">
-              <button onClick={togglePower} className={`p-2 rounded-lg transition-all ${status === 'offline' ? 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-red-600/10 hover:bg-red-600/20 text-red-500'}`}>
-                {status === 'offline' ? <Power size={18} /> : <StopCircle size={18} />}
-              </button>
-              <button disabled={status === 'offline'} className="p-2 bg-white/5 hover:bg-white/10 rounded-lg transition-colors text-white/60 disabled:opacity-30">
-                <RotateCcw size={18} />
-              </button>
-            </div>
-          </div>
-        </header>
-
-        {/* Viewport */}
-        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
-          
-          <AnimatePresence mode="wait">
-            {activeTab === 'console' && (
-              <motion.div 
-                key="console"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-6"
-              >
-                {/* Metrics Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <MetricCard icon={Cpu} label="Uso de CPU" value="24%" subtext="Cores: 4/12" color="blue" />
-                  <MetricCard icon={Database} label="Uso de RAM" value="3.2 GB" subtext="Limite: 8 GB" color="purple" />
-                  <MetricCard icon={Network} label="Latência" value="12ms" subtext="Porta: 25565" color="green" />
-                  <MetricCard icon={Users} label="Jogadores" value="12/50" subtext="Pico: 34" color="orange" />
+        {/* Main Content */}
+        <main className="flex-1 p-10 overflow-y-auto">
+          {activeTab === 'dashboard' && (
+            <div className="max-w-6xl mx-auto space-y-10">
+              <header className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+                <div>
+                  <h2 className="text-3xl font-black text-white italic tracking-tight uppercase">Meus Servidores</h2>
+                  <p className="text-zinc-500 mt-1 uppercase text-[10px] font-black tracking-widest">— Gerencie suas instâncias de Minecraft</p>
                 </div>
-
-                {/* Charts & Stats */}
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                  <div className="lg:col-span-2 bg-[#1a1a1a] border border-white/5 rounded-2xl p-6 h-[400px]">
-                    <div className="flex items-center justify-between mb-6">
-                      <h3 className="font-semibold text-white/80 flex items-center gap-2">
-                        <Activity size={18} className="text-orange-500" />
-                        Desempenho Histórico
-                      </h3>
-                      <div className="flex gap-2">
-                        <span className="text-[10px] uppercase font-mono text-blue-400 bg-blue-500/10 px-2 py-1 rounded">CPU %</span>
-                        <span className="text-[10px] uppercase font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">RAM %</span>
-                      </div>
-                    </div>
-                    <div className="h-[300px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={metricsData}>
-                          <defs>
-                            <linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
-                              <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
-                            </linearGradient>
-                            <linearGradient id="colorRam" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="5%" stopColor="#a855f7" stopOpacity={0.3}/>
-                              <stop offset="95%" stopColor="#a855f7" stopOpacity={0}/>
-                            </linearGradient>
-                          </defs>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" vertical={false} />
-                          <XAxis dataKey="time" hide />
-                          <YAxis stroke="#555" fontSize={10} axisLine={false} tickLine={false} domain={[0, 100]} />
-                          <Tooltip 
-                            contentStyle={{ backgroundColor: '#141414', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px' }}
-                            itemStyle={{ fontSize: '12px' }}
-                          />
-                          <Area type="monotone" dataKey="cpu" stroke="#3b82f6" fillOpacity={1} fill="url(#colorCpu)" />
-                          <Area type="monotone" dataKey="ram" stroke="#a855f7" fillOpacity={1} fill="url(#colorRam)" />
-                        </AreaChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-
-                  <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl p-6 flex flex-col">
-                    <h3 className="font-semibold text-white/80 mb-6 flex items-center gap-2">
-                      <ShieldCheck size={18} className="text-green-500" />
-                      Status do Daemon
-                    </h3>
-                    <div className="flex-1 space-y-6">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-white/40">Versão do Daemon</span>
-                        <span className="text-sm font-mono text-white/80">v1.14.2</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-white/40">Uptime</span>
-                        <span className="text-sm font-mono text-white/80">14d 02h 55m</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-white/40">Sincronização</span>
-                        <span className="text-sm font-mono text-green-500 flex items-center gap-1.5">
-                          <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                          Estável
-                        </span>
-                      </div>
-                      <div className="pt-6 border-t border-white/5">
-                        <div className="text-xs text-white/40 mb-3 uppercase tracking-widest font-mono">Ações Rápidas</div>
-                        <div className="grid grid-cols-2 gap-2">
-                          <button className="flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors text-xs font-medium">
-                            <Box size={14} /> Backups
-                          </button>
-                          <button className="flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors text-xs font-medium">
-                            <Settings size={14} /> Props
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+                <div className="flex items-center gap-3 bg-zinc-900/50 p-1.5 rounded-2xl border border-zinc-800 backdrop-blur-xl">
+                  <input 
+                    type="file" 
+                    id="file-upload" 
+                    className="hidden" 
+                    onChange={(e) => setFile(e.target.files?.[0] || null)}
+                    accept=".zip"
+                  />
+                  <label 
+                    htmlFor="file-upload"
+                    className="flex items-center gap-2 px-4 py-2.5 bg-emerald-500 text-zinc-950 rounded-xl text-xs font-black uppercase tracking-widest cursor-pointer hover:bg-emerald-400 transition-all shadow-lg shadow-emerald-500/20 active:scale-95"
+                  >
+                    {isUploading ? <Loader2 className="animate-spin" size={14} /> : <Upload size={14} />}
+                    {isUploading ? 'Processando...' : 'Criar Novo (ZIP)'}
+                  </label>
+                  {file && (
+                    <button 
+                      onClick={handleUpload}
+                      className="px-4 py-2.5 bg-zinc-800 text-white rounded-xl text-xs font-black uppercase tracking-widest hover:bg-zinc-700 transition-all"
+                    >
+                      Confirmar
+                    </button>
+                  )}
                 </div>
+              </header>
 
-                {/* Real Console */}
-                <div className="bg-black border border-white/10 rounded-2xl overflow-hidden flex flex-col h-[500px] shadow-2xl">
-                  <div className="bg-[#141414] px-6 py-3 border-b border-white/5 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-xs font-mono text-white/60">
-                      <Terminal size={14} /> /home/container/console
+              {/* Server Grid */}
+              {servers.length === 0 ? (
+                <div className="border border-dashed border-zinc-800 rounded-[2rem] p-20 flex flex-col items-center justify-center text-center">
+                  <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center mb-6 border border-zinc-800">
+                    <Server className="text-zinc-600" size={32} />
+                  </div>
+                  <h3 className="text-xl font-bold text-white mb-2">Nenhum servidor ativo</h3>
+                  <p className="text-zinc-500 text-sm max-w-sm">Suba um arquivo .zip contendo seu servidor Minecraft (server.jar) para começar.</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {servers.map((server) => (
+                    <ServerCard 
+                      key={server.id} 
+                      server={server} 
+                      onStart={() => startServer(server.id)}
+                      onStop={() => stopServer(server.id)}
+                      onSelect={() => setSelectedServerId(server.id)}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {/* Selected Server Console Simulator */}
+              {selectedServerId && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-zinc-900/50 border border-zinc-800 rounded-[2.5rem] overflow-hidden backdrop-blur-xl"
+                >
+                  <div className="px-8 py-6 bg-zinc-800/30 border-b border-zinc-800 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Terminal size={18} className="text-emerald-500" />
+                      <h3 className="text-sm font-black text-white uppercase italic tracking-widest">Console: {selectedServerId}</h3>
                     </div>
                     <div className="flex gap-1.5">
-                      <div className="w-3 h-3 rounded-full bg-red-500/20" />
-                      <div className="w-3 h-3 rounded-full bg-yellow-500/20" />
-                      <div className="w-3 h-3 rounded-full bg-green-500/20" />
+                      <div className="w-3 h-3 rounded-full bg-zinc-700" />
+                      <div className="w-3 h-3 rounded-full bg-zinc-700" />
+                      <div className="w-3 h-3 rounded-full bg-zinc-700" />
                     </div>
                   </div>
-                  
-                  <div 
-                    ref={scrollRef}
-                    className="flex-1 p-6 font-mono text-sm overflow-y-auto space-y-1.5 custom-scrollbar bg-[#050505]"
-                  >
-                    {consoleOutput.length === 0 && (
-                      <div className="text-white/20 italic select-none">Nenhuma atividade registrada ainda...</div>
-                    )}
-                    {consoleOutput.map(line => (
-                      <div key={line.id} className="group flex gap-3 animate-in fade-in slide-in-from-left-4 duration-300">
-                        <span className="shrink-0 text-white/20 select-none">{line.timestamp}</span>
-                        <span className={`
-                          ${line.type === 'error' ? 'text-red-400' : ''}
-                          ${line.type === 'warn' ? 'text-yellow-400' : ''}
-                          ${line.type === 'success' ? 'text-green-400' : ''}
-                          ${line.type === 'command' ? 'text-blue-400 font-bold' : 'text-white/80'}
-                        `}>
-                          {line.message}
-                        </span>
-                      </div>
-                    ))}
+                  <div className="p-8 h-80 overflow-y-auto font-mono text-xs space-y-1 text-emerald-500/80 bg-black/40">
+                    <p className="opacity-40">[{new Date().toLocaleTimeString()}] System: Attached to container...</p>
+                    <p>[INFO] Starting minecraft server version 1.20.1</p>
+                    <p>[INFO] Loading properties...</p>
+                    <p>[INFO] Default game type: SURVIVAL</p>
+                    <p className="text-zinc-500">— Log principal oculto para demonstração —</p>
                   </div>
-
-                  <form onSubmit={handleCommand} className="p-4 bg-[#141414] border-t border-white/5 flex gap-4">
-                    <div className="flex-1 relative">
-                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-blue-500 font-bold">$</span>
-                      <input 
-                        type="text" 
-                        value={command}
-                        onChange={(e) => setCommand(e.target.value)}
-                        placeholder="Digite um comando para o servidor..." 
-                        className="w-full bg-black border border-white/10 rounded-xl py-3 pl-10 pr-4 text-sm font-mono focus:outline-none focus:border-blue-500/50 transition-colors"
-                      />
-                    </div>
-                    <button type="submit" className="px-6 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl font-medium transition-all shadow-lg shadow-blue-900/20">
-                      Executar
-                    </button>
-                  </form>
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'files' && (
-              <motion.div 
-                key="files"
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -20 }}
-                className="space-y-6"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1">
-                    <h2 className="text-2xl font-bold">Gerenciador de Arquivos</h2>
-                    <p className="text-white/50 text-sm">Visualize e gerencie a estrutura de arquivos da sua instância.</p>
-                  </div>
-                  <div className="flex gap-3">
-                    <button className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl transition-colors text-sm">
-                      <Folder size={16} /> Nova Pasta
-                    </button>
-                    <button className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 rounded-xl transition-colors text-sm font-medium shadow-lg shadow-orange-900/20">
-                      <Plus size={16} /> Upload
-                    </button>
-                  </div>
-                </div>
-
-                <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl overflow-hidden shadow-xl">
-                  <div className="grid grid-cols-12 gap-4 px-6 py-4 border-b border-white/5 text-[10px] uppercase tracking-widest text-white/40 font-mono">
-                    <div className="col-span-6">Nome</div>
-                    <div className="col-span-2">Tamanho</div>
-                    <div className="col-span-3">Modificado em</div>
-                    <div className="col-span-1 text-right">Ação</div>
-                  </div>
-
-                  <div className="divide-y divide-white/5">
-                    {MOCK_FILES.map((file, idx) => (
-                      <div key={idx} className="grid grid-cols-12 gap-4 px-6 py-4 items-center hover:bg-white/[0.02] cursor-pointer group transition-colors">
-                        <div className="col-span-6 flex items-center gap-3">
-                          {file.type === 'directory' ? <Folder className="text-orange-500" size={18} /> : <FileText className="text-white/40" size={18} />}
-                          <span className="text-sm font-medium group-hover:text-orange-400 transition-colors">{file.name}</span>
-                        </div>
-                        <div className="col-span-2 text-sm text-white/40 font-mono">{file.size}</div>
-                        <div className="col-span-3 text-sm text-white/40 font-mono">{file.modified}</div>
-                        <div className="col-span-1 flex justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button className="p-2 hover:bg-red-500/10 text-red-500 rounded-lg transition-colors">
-                            <Trash2 size={16} />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'modpacks' && (
-              <motion.div 
-                key="modpacks"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 1.05 }}
-                className="space-y-8"
-              >
-                <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
-                  <div className="space-y-1">
-                    <h2 className="text-2xl font-bold">Mercado de Modpacks</h2>
-                    <p className="text-white/50 text-sm">Instalação de modpacks em um clique diretamente dos repositórios oficiais.</p>
-                  </div>
-                  <div className="w-full md:w-96 relative">
-                    <Search size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                  <div className="p-4 bg-zinc-900 border-t border-zinc-800">
                     <input 
                       type="text" 
-                      placeholder="Pesquisar modpacks (ex: SkyBlock)..." 
-                      className="w-full bg-[#1a1a1a] border border-white/10 rounded-2xl py-3 pl-12 pr-4 text-sm focus:outline-none focus:border-orange-500/50 transition-all"
+                      placeholder="Enviar comando..." 
+                      className="w-full bg-black border border-zinc-800 rounded-xl px-6 py-3 text-sm text-emerald-500 outline-none focus:border-emerald-500/40 transition-all font-mono"
                     />
                   </div>
-                </div>
+                </motion.div>
+              )}
+            </div>
+          )}
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                  {MOCK_MODPACKS.map(pack => (
-                    <div key={pack.id} className="bg-[#1a1a1a] border border-white/5 rounded-2xl overflow-hidden group hover:border-orange-500/30 transition-all hover:shadow-2xl hover:shadow-orange-900/10 flex flex-col">
-                      <div className="relative h-48 overflow-hidden bg-slate-800">
-                        <img 
-                          src={pack.logo} 
-                          alt={pack.name} 
-                          className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500 opacity-80"
-                        />
-                        <div className="absolute inset-0 bg-gradient-to-t from-[#1a1a1a] to-transparent" />
-                        <div className="absolute bottom-4 left-4 right-4 flex justify-between items-end">
-                          <div className="px-2 py-1 bg-black/50 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest text-orange-400 border border-orange-500/20">
-                            {pack.vendor}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="p-5 space-y-4 flex-1 flex flex-col">
-                        <div>
-                          <h4 className="font-bold text-lg leading-tight mb-1">{pack.name}</h4>
-                          <div className="flex items-center gap-3">
-                            <span className="text-xs text-white/30">{pack.version}</span>
-                            <span className="text-xs text-white/30 flex items-center gap-1">
-                              <Download size={12} /> {pack.downloads}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="pt-4 mt-auto">
-                          <button className="w-full py-3 bg-white/5 hover:bg-orange-600 rounded-xl transition-all font-semibold text-xs uppercase tracking-widest flex items-center justify-center gap-2">
-                            Instalar Modpack
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                  
-                  {/* Custom Install */}
-                  <div className="bg-transparent border border-dashed border-white/10 rounded-2xl p-6 flex flex-col items-center justify-center text-center space-y-4 hover:border-orange-500/40 hover:bg-orange-500/[0.02] transition-all cursor-pointer group">
-                    <div className="w-12 h-12 bg-white/5 group-hover:bg-orange-500/10 rounded-full flex items-center justify-center text-white/30 group-hover:text-orange-500 transition-colors">
-                      <Download size={24} />
-                    </div>
-                    <div>
-                      <h4 className="font-bold">Instalação Custom</h4>
-                      <p className="text-xs text-white/30 mt-1">Envie seu próprio .zip de modpack</p>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      </main>
+          {activeTab === 'files' && (
+            <div className="flex items-center justify-center h-full text-center">
+               <div>
+                  <FolderOpen size={48} className="mx-auto mb-4 opacity-20" />
+                  <h2 className="text-xl font-bold text-white uppercase italic tracking-widest">Painel de Arquivos</h2>
+                  <p className="text-zinc-500 text-sm mt-2 font-black uppercase text-[10px] tracking-widest">Disponível em VPS Linux (Modo Root)</p>
+               </div>
+            </div>
+          )}
+        </main>
+      </div>
 
-      {/* Mini Status Bar (Bottom) */}
-      <footer className="fixed bottom-0 left-0 right-0 h-8 bg-[#0a0a0a] border-t border-white/5 flex items-center justify-between px-6 text-[10px] font-mono text-white/30 z-30">
-        <div className="flex items-center gap-6">
+      {/* Footer / Stats Bar */}
+      <footer className="fixed bottom-0 left-0 right-0 h-10 bg-zinc-950 border-t border-zinc-900 flex items-center justify-between px-6 z-20">
+        <div className="flex items-center gap-6 text-[10px] font-black uppercase tracking-[0.2em] text-zinc-600">
           <div className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full ${status === 'online' ? 'bg-green-500' : 'bg-red-500'}`} />
-            DAEMON: ESTÁVEL
+            <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
+            Cluster: Online
           </div>
-          <div className="hidden sm:block">UPTIME: 14:02:55:12</div>
-          <div className="hidden sm:block">SERVER IP: 144.22.10.45:25565</div>
+          <div>API v2.4—Stable</div>
         </div>
-        <div className="flex items-center gap-4 uppercase tracking-widest">
-          <span>Mem: 3.2GB / 8GB</span>
-          <span className="text-orange-500/60 transition-pulse">Sync Active</span>
+        <div className="text-[10px] font-black uppercase tracking-[0.2em] text-zinc-400">
+          MinePanel Pro Generator — 2026 Edition
         </div>
       </footer>
     </div>
   );
 }
 
-// --- Componentes Auxiliares UI ---
+// --- Helper Components ---
 
-function NavItem({ icon: Icon, label, active, onClick, collapsed }: any) {
+function SidebarLink({ active, icon: Icon, label, onClick }: any) {
   return (
     <button 
       onClick={onClick}
-      className={`
-        w-full flex items-center gap-4 px-4 py-3.5 rounded-xl transition-all group relative
-        ${active ? 'bg-orange-600 text-white shadow-lg shadow-orange-900/20' : 'text-white/40 hover:text-white/80 hover:bg-white/5'}
-      `}
+      className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 font-bold text-sm tracking-tight ${
+        active 
+        ? 'bg-emerald-500 text-zinc-950 shadow-xl shadow-emerald-500/10' 
+        : 'text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900/50'
+      }`}
     >
-      <Icon size={20} className={active ? 'text-white' : 'text-white/20 group-hover:text-white/60 transition-colors'} />
-      {!collapsed && (
-        <span className="text-sm font-medium transition-opacity">{label}</span>
-      )}
-      {active && collapsed && (
-        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-1 h-6 bg-white rounded-l-full" />
-      )}
+      <Icon size={18} className={active ? 'text-zinc-950' : 'text-zinc-600'} />
+      {label}
     </button>
+  );
+}
+
+function ServerCard({ server, onStart, onStop, onSelect }: { server: ServerData, onStart: () => void, onStop: () => void, onSelect: () => void }) {
+  const isOnline = server.status === 'online';
+  const isStarting = server.status === 'starting';
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      className="group bg-zinc-900/50 border border-zinc-800 rounded-[2rem] p-6 hover:border-emerald-500/30 transition-all hover:bg-zinc-900 shadow-2xl relative overflow-hidden"
+    >
+      <div className="flex items-center justify-between mb-8">
+        <div className="flex items-center gap-3">
+          <div className={`w-10 h-10 rounded-xl flex items-center justify-center border ${
+            isOnline ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500' : 'bg-zinc-800 border-zinc-700 text-zinc-600'
+          }`}>
+            <Server size={20} />
+          </div>
+          <div>
+            <h4 className="font-black text-white text-sm uppercase italic tracking-widest">{server.name}</h4>
+            <div className="flex items-center gap-1.5 mt-0.5">
+              <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-700'}`} />
+              <p className="text-[10px] font-black uppercase text-zinc-500 tracking-widest">
+                {server.status}
+              </p>
+            </div>
+          </div>
+        </div>
+        <button onClick={onSelect} className="p-2.5 bg-zinc-800 rounded-xl text-zinc-500 hover:text-white transition-colors">
+          <ChevronRight size={16} />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mb-8">
+        <div className="bg-zinc-950/50 p-4 rounded-2xl border border-zinc-800">
+          <div className="flex items-center gap-2 mb-1 opacity-40">
+            <Activity size={12} />
+            <span className="text-[9px] font-black uppercase tracking-widest text-white">CPU/RAM</span>
+          </div>
+          <p className="text-xl font-black text-white tracking-tighter">{server.ram}</p>
+        </div>
+        <div className="bg-zinc-950/50 p-4 rounded-2xl border border-zinc-800">
+          <div className="flex items-center gap-2 mb-1 opacity-40">
+            <Users size={12} />
+            <span className="text-[9px] font-black uppercase tracking-widest text-white">Jogadores</span>
+          </div>
+          <p className="text-xl font-black text-white tracking-tighter">{server.players}</p>
+        </div>
+      </div>
+
+      <div className="flex gap-2.5">
+        {!isOnline ? (
+          <button 
+            onClick={onStart}
+            disabled={isStarting}
+            className="flex-1 flex items-center justify-center gap-2 py-4 bg-emerald-500 text-zinc-950 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-400 transition-all disabled:opacity-50"
+          >
+            {isStarting ? <Loader2 className="animate-spin" size={14} /> : <Power size={14} />}
+            Ligar
+          </button>
+        ) : (
+          <button 
+            onClick={onStop}
+            className="flex-1 flex items-center justify-center gap-2 py-4 bg-zinc-800 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-red-500 hover:text-white transition-all group/stop"
+          >
+            <Power size={14} className="group-hover/stop:rotate-180 transition-transform" />
+            Parar
+          </button>
+        )}
+      </div>
+
+      {/* Decorative corner */}
+      <div className="absolute top-0 right-0 w-16 h-16 pointer-events-none">
+        <div className="absolute top-[-24px] right-[-24px] w-12 h-12 bg-white/5 rotate-45" />
+      </div>
+    </motion.div>
   );
 }
