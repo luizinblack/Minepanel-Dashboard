@@ -423,6 +423,7 @@ export default function App() {
             formData.append('total', totalChunks.toString());
             formData.append('fileName', file.name);
             formData.append('mimeType', file.type);
+            formData.append('relativePath', file.webkitRelativePath || file.name);
 
             const res = await fetch('/api/admin/upload/chunk', {
               method: 'POST',

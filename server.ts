@@ -796,11 +796,11 @@ async function startServer() {
 
       // All chunks received, initial merge
       try {
-        const subDir = getSubDirForMime(req.body.mimeType || 'application/octet-stream');
-        const sanitizedName = (fileName || 'unnamed').replace(/[^a-zA-Z0-9.\-_ ()]/g, '_');
-        const ext = path.extname(sanitizedName);
-        const storedName = `${uuidv4()}${ext}`;
-        const finalPath = path.join(STANDARDIZED_UPLOADS_DIR, subDir, storedName);
+        const relativePath = req.body.relativePath || fileName;
+        const finalPath = path.join(STANDARDIZED_UPLOADS_DIR, relativePath);
+        
+        const finalDir = path.dirname(finalPath);
+        if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
 
         const writeStream = fs.createWriteStream(finalPath);
         
@@ -819,12 +819,12 @@ async function startServer() {
 
         const metadata = {
           id: uuidv4(),
-          originalName: sanitizedName,
-          storedName: storedName,
+          originalName: fileName || 'unnamed',
+          storedName: relativePath,
           size: fs.statSync(finalPath).size,
           type: req.body.mimeType || 'application/octet-stream',
           uploadedAt: new Date().toISOString(),
-          category: subDir
+          category: path.dirname(relativePath)
         };
 
         const currentMetadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
@@ -1218,36 +1218,31 @@ async function startServer() {
   
       const scanDir = (dir: string, relative = "") => {
         if (!fs.existsSync(dir)) return;
-  
         const items = fs.readdirSync(dir);
   
         for (const item of items) {
           const fullPath = path.join(dir, item);
           const stat = fs.statSync(fullPath);
   
+          results.push({
+            name: item,
+            path: path.join(relative, item),
+            size: stat.size,
+            mtime: stat.mtime,           // frontend usa mtime
+            isDirectory: stat.isDirectory(), // frontend usa isDirectory
+            type: stat.isDirectory() ? "directory" : "file"
+          });
+  
           if (stat.isDirectory()) {
             scanDir(fullPath, path.join(relative, item));
-          } else {
-            results.push({
-              name: item,
-              path: path.join(relative, item),
-              size: stat.size,
-              uploadedAt: stat.birthtime,
-              type: "file"
-            });
           }
         }
       };
   
       scanDir(STANDARDIZED_UPLOADS_DIR);
-  
       res.json(results);
     } catch (err: any) {
-      console.error(err);
-  
-      res.status(500).json({
-        error: "Erro ao listar arquivos"
-      });
+      res.status(500).json({ error: "Erro ao listar arquivos" });
     }
   });
 
