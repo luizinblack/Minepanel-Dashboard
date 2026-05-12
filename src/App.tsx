@@ -372,14 +372,16 @@ export default function App() {
   };
 
   const uploadChunked = async (file: File, options: any = {}) => {
-    setIsUploading(true);
+    const { 
+      onProgress = () => {}, 
+      fileId = `${file.name}-${file.size}-${file.lastModified}`,
+      CHUNK_SIZE = 50 * 1024 * 1024, // 50MB per chunk (optimized for large sets)
+      sharedLimit = globalUploadLimit,
+      manageUploadState = true
+    } = options;
+
+    if (manageUploadState) setIsUploading(true);
     try {
-      const { 
-        onProgress = () => {}, 
-        fileId = `${file.name}-${file.size}-${file.lastModified}`,
-        CHUNK_SIZE = 50 * 1024 * 1024, // 50MB per chunk (optimized for large sets)
-        sharedLimit = globalUploadLimit
-      } = options;
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const token = localStorage.getItem('minecontrol_token');
@@ -460,7 +462,7 @@ export default function App() {
         throw new Error(`${failed.length} chunks falharam. Exemplo: ${firstError.reason?.message || "Unknown error"}`);
       }
     } finally {
-      setIsUploading(false);
+      if (manageUploadState) setIsUploading(false);
     }
   };
 
@@ -509,7 +511,10 @@ export default function App() {
       for (let i = 0; i < totalFiles; i++) {
         const file = files[i];
         tasks.push(globalUploadLimit(async () => {
-          await uploadChunked(file, { sharedLimit: globalUploadLimit });
+          await uploadChunked(file, { 
+            sharedLimit: globalUploadLimit,
+            manageUploadState: false
+          });
           processedCount++;
           const p = Math.round((processedCount / totalFiles) * 100);
           setActiveUploads(prev => prev.map(u => u.id === folderUploadId 
