@@ -1,751 +1,619 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Server, 
   Terminal, 
-  ShieldCheck, 
-  Copy, 
-  Check, 
+  Files, 
+  Box, 
+  Settings, 
+  Power, 
+  RotateCcw, 
+  StopCircle, 
+  Cpu, 
+  Database, 
+  Network, 
+  Users, 
+  Search, 
+  Download, 
+  Trash2, 
+  Folder, 
+  FileText, 
   ChevronRight,
-  Info,
-  Settings,
-  FileCode,
-  Layout,
-  Lock,
-  Globe,
-  Monitor,
+  HardDrive,
   Activity,
-  Key,
-  FolderOpen,
-  CloudUpload,
-  Box,
-  Save,
-  Download,
-  AlertTriangle,
-  ChevronDown
+  ShieldCheck,
+  LayoutDashboard,
+  Menu,
+  X,
+  Bell,
+  User,
+  Plus
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { 
+  LineChart, 
+  Line, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ResponsiveContainer,
+  AreaChart,
+  Area
+} from 'recharts';
 
-// --- Types ---
-interface Config {
-  serverName: string;
-  panelUrl: string;
-  serverId: string;
-  apiKey: string;
-  vpsPath: string;
-  adminUser: string;
-  adminPassword: string;
-  jwtSecret: string;
-  curseForgeKey: string;
-  domain: string;
-  backendPort: string;
+// --- Tipos & Interfaces ---
+
+type ServerStatus = 'online' | 'offline' | 'starting' | 'stopping' | 'hidden';
+
+interface ConsoleLine {
+  id: string;
+  timestamp: string;
+  message: string;
+  type: 'info' | 'error' | 'warn' | 'success' | 'command';
 }
+
+interface FileItem {
+  name: string;
+  type: 'file' | 'directory';
+  size: string;
+  modified: string;
+}
+
+interface Modpack {
+  id: string;
+  name: string;
+  version: string;
+  vendor: string;
+  downloads: string;
+  logo: string;
+}
+
+// --- Dados de Exemplo ---
+
+const MOCK_FILES: FileItem[] = [
+  { name: 'mods', type: 'directory', size: '--', modified: '12/05/2026 14:30' },
+  { name: 'world', type: 'directory', size: '--', modified: '12/05/2026 18:21' },
+  { name: 'config', type: 'directory', size: '--', modified: '11/05/2026 09:15' },
+  { name: 'server.properties', type: 'file', size: '2.4 KB', modified: '12/05/2026 10:00' },
+  { name: 'eula.txt', type: 'file', size: '0.1 KB', modified: '10/05/2026 11:00' },
+  { name: 'ops.json', type: 'file', size: '0.4 KB', modified: '12/05/2026 17:45' },
+  { name: 'whitelist.json', type: 'file', size: '0.2 KB', modified: '01/05/2026 12:00' },
+  { name: 'forge-1.20.1.jar', type: 'file', size: '42.5 MB', modified: '05/05/2026 20:30' },
+];
+
+const MOCK_MODPACKS: Modpack[] = [
+  { id: '1', name: 'Better Minecraft', version: 'v25', vendor: 'Forge', downloads: '1.2M', logo: 'https://media.forgecdn.net/avatars/402/894/637604470129206627.png' },
+  { id: '2', name: 'All the Mods 9', version: 'v1.4.2', vendor: 'Forge', downloads: '850K', logo: 'https://media.forgecdn.net/avatars/615/656/637953284074213794.png' },
+  { id: '3', name: 'RLCraft', version: 'v2.9.3', vendor: 'Forge', downloads: '3.4M', logo: 'https://media.forgecdn.net/avatars/158/899/636662491104648753.png' },
+  { id: '4', name: 'SkyFactory 4', version: 'v4.2.4', vendor: 'Forge', downloads: '2.8M', logo: 'https://media.forgecdn.net/avatars/200/524/636906209867905814.png' },
+];
+
+// --- Sub-componentes ---
+
+const MetricCard = ({ icon: Icon, label, value, subtext, color }: any) => (
+  <div className="bg-[#1a1a1a] border border-white/5 p-4 rounded-xl space-y-3">
+    <div className="flex items-center justify-between">
+      <div className={`p-2 rounded-lg bg-${color}-500/10 text-${color}-500`}>
+        <Icon size={20} />
+      </div>
+      <div className="text-[10px] uppercase tracking-wider text-white/40 font-mono">Real-time</div>
+    </div>
+    <div>
+      <div className="text-2xl font-mono font-medium text-white">{value}</div>
+      <div className="text-xs text-white/50 flex items-center gap-1">
+        {label} <span className="text-[10px] opacity-30">•</span> {subtext}
+      </div>
+    </div>
+  </div>
+);
+
+// --- Componente Principal ---
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'config' | 'backend' | 'frontend' | 'infra' | 'readme'>('config');
-  const [copied, setCopied] = useState<string | null>(null);
+  const [status, setStatus] = useState<ServerStatus>('online');
+  const [activeTab, setActiveTab] = useState<'console' | 'files' | 'modpacks' | 'backups' | 'settings'>('console');
+  const [consoleOutput, setConsoleOutput] = useState<ConsoleLine[]>([]);
+  const [command, setCommand] = useState('');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-  const [config, setConfig] = useState<Config>({
-    serverName: 'Meu Servidor Modpack',
-    panelUrl: 'https://ptero.meudominio.com',
-    serverId: 'id_aqui',
-    apiKey: 'ptlc_chave_aqui',
-    vpsPath: '/var/lib/pterodactyl/volumes/id_aqui',
-    adminUser: 'admin',
-    adminPassword: 'senha_segura_123',
-    jwtSecret: 'secreta_muito_longa_e_aleatoria',
-    curseForgeKey: 'cf_api_key_opcional',
-    domain: 'minepaneldashboard.com.br',
-    backendPort: '3000'
-  });
+  // Simular métricas (CPU/RAM)
+  const [metricsData, setMetricsData] = useState<any[]>([]);
 
-  const handleCopy = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
+  useEffect(() => {
+    // Gerar dados iniciais do gráfico
+    const initial = Array.from({ length: 20 }, (_, i) => ({
+      time: i,
+      cpu: Math.floor(Math.random() * 40) + 10,
+      ram: Math.floor(Math.random() * 20) + 60,
+    }));
+    setMetricsData(initial);
+
+    // Atualizar métricas a cada 3s
+    const interval = setInterval(() => {
+      setMetricsData(prev => {
+        const next = [...prev.slice(1), {
+          time: prev[prev.length - 1].time + 1,
+          cpu: Math.floor(Math.random() * 40) + 10,
+          ram: Math.floor(Math.random() * 20) + 60,
+        }];
+        return next;
+      });
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Simular logs de console aleatórios
+  useEffect(() => {
+    const messages = [
+      '[Server thread/INFO]: Player JohnDoe joined the game',
+      '[Server thread/INFO]: जॉन joined the game',
+      '[Server thread/WARN]: Can\'t keep up! Is the server overloaded?',
+      '[Server thread/INFO]: JohnDoe issued server command: /tps',
+      '[Server thread/INFO]: TPM in world "world" is 20.0 (100%)',
+      '[Server thread/INFO]: Chunk saved in 45ms',
+    ];
+
+    const logInterval = setInterval(() => {
+      if (status === 'online') {
+        const msg = messages[Math.floor(Math.random() * messages.length)];
+        addLog(msg);
+      }
+    }, 8000);
+
+    return () => clearInterval(logInterval);
+  }, [status]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [consoleOutput]);
+
+  const addLog = (message: string, type: ConsoleLine['type'] = 'info') => {
+    const newLine: ConsoleLine = {
+      id: Math.random().toString(36).substr(2, 9),
+      timestamp: new Date().toLocaleTimeString('pt-BR', { hour12: false }),
+      message,
+      type
+    };
+    setConsoleOutput(prev => [...prev.slice(-100), newLine]);
   };
 
-  // --- Generated Content ---
-
-  const envExample = `# Pterodactyl Link
-PTERODACTYL_URL=${config.panelUrl}
-PTERODACTYL_API_KEY=${config.apiKey}
-SERVER_ID=${config.serverId}
-SERVER_PATH=${config.vpsPath}
-
-# Painel Auth
-ADMIN_USER=${config.adminUser}
-ADMIN_PASSWORD=${config.adminPassword}
-JWT_SECRET=${config.jwtSecret}
-
-# Extras
-PORT=${config.backendPort}
-CURSEFORGE_API_KEY=${config.curseForgeKey}
-NODE_ENV=production`;
-
-  const serverJsContent = `// backend/server.js - API Comentada em Português
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const fs = require('fs-extra');
-const path = require('path');
-const multer = require('multer');
-const archiver = require('archiver');
-const unzipper = require('unzipper');
-require('dotenv').config();
-
-const app = express();
-app.use(express.json());
-app.use(cors());
-
-const SERVER_PATH = process.env.SERVER_PATH;
-const PTERO_URL = process.env.PTERODACTYL_URL;
-const API_KEY = process.env.PTERODACTYL_API_KEY;
-const SERVER_ID = process.env.SERVER_ID;
-const JWT_SECRET = process.env.JWT_SECRET;
-
-// --- Middleware de Autenticação (JWT) ---
-const authenticate = (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Acesso Negado: Faça login' });
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (err) {
-        res.status(401).json({ error: 'Sessão expirada' });
-    }
-};
-
-// --- Rota de Login ---
-app.post('/api/login', (req, res) => {
-    const { user, password } = req.body;
-    if (user === process.env.ADMIN_USER && password === process.env.ADMIN_PASSWORD) {
-        const token = jwt.sign({ user }, JWT_SECRET, { expiresIn: '7d' });
-        res.json({ token, success: true });
-    } else {
-        res.status(401).json({ error: 'Dados inválidos' });
-    }
-});
-
-// --- Cliente Pterodactyl Configurado ---
-const ptero = axios.create({
-    baseURL: \`\${PTERO_URL}/api/client/servers/\${SERVER_ID}\`,
-    headers: { 'Authorization': \`Bearer \${API_KEY}\` }
-});
-
-// Busca recursos (CPU, RAM, Status)
-app.get('/api/status', authenticate, async (req, res) => {
-    try {
-        const { data } = await ptero.get('/resources');
-        res.json(data.attributes);
-    } catch (e) { res.status(500).json({ error: 'Erro ao conectar ao Pterodactyl' }); }
-});
-
-// Controle de Energia (start, stop, restart, kill)
-app.post('/api/power', authenticate, async (req, res) => {
-    try {
-        await ptero.post('/power', { signal: req.body.signal });
-        res.json({ success: true, action: req.body.signal });
-    } catch (e) { res.status(500).json({ error: 'Falha ao enviar sinal' }); }
-});
-
-// --- Gerenciador de Arquivos (Nativo) ---
-app.get('/api/files/list', authenticate, async (req, res) => {
-    const relativePath = req.query.path || '';
-    const fullPath = path.join(SERVER_PATH, relativePath);
-    try {
-        const items = await fs.readdir(fullPath, { withFileTypes: true });
-        const list = items.map(item => {
-            const stats = fs.statSync(path.join(fullPath, item.name));
-            return {
-                name: item.name,
-                isDirectory: item.isDirectory(),
-                size: stats.size,
-                modified: stats.mtime
-            };
-        });
-        res.json(list);
-    } catch (e) { res.status(500).json({ error: 'Erro ao listar diretório' }); }
-});
-
-app.get('/api/files/read', authenticate, async (req, res) => {
-    const fullPath = path.join(SERVER_PATH, req.query.path);
-    try {
-        const content = await fs.readFile(fullPath, 'utf8');
-        res.json({ content });
-    } catch (e) { res.status(500).json({ error: 'Não foi possível ler o arquivo' }); }
-});
-
-app.post('/api/files/save', authenticate, async (req, res) => {
-    const fullPath = path.join(SERVER_PATH, req.body.path);
-    try {
-        await fs.writeFile(fullPath, req.body.content);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Não foi possível salvar' }); }
-});
-
-// --- Upload de Pasta Integrado (via .zip) ---
-const upload = multer({ dest: 'uploads/' });
-app.post('/api/upload-folder', authenticate, upload.single('file'), async (req, res) => {
-    try {
-        await fs.createReadStream(req.file.path)
-            .pipe(unzipper.Extract({ path: SERVER_PATH }))
-            .promise();
-        await fs.remove(req.file.path); // Limpa temp
-        res.json({ success: true, message: 'Arquivos extraídos com sucesso na pasta do servidor!' });
-    } catch (e) { res.status(500).json({ error: 'Erro na extração dos arquivos' }); }
-});
-
-// --- Sistema de Backup do Mundo ---
-app.post('/api/backup/world', authenticate, async (req, res) => {
-    const worldPath = path.join(SERVER_PATH, 'world');
-    const backupFolder = path.join(SERVER_PATH, '..', 'backups-painel');
-    const backupName = \`world-backup-\${new Date().toISOString().replace(/:/g, '-')}.zip\`;
-    const outputPath = path.join(backupFolder, backupName);
+  const handleCommand = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!command.trim()) return;
+    addLog(`> ${command}`, 'command');
+    setCommand('');
     
-    await fs.ensureDir(backupFolder);
-    const output = fs.createWriteStream(outputPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
-
-    output.on('close', () => res.json({ success: true, name: backupName }));
-    archive.pipe(output);
-    archive.directory(worldPath, 'world');
-    archive.finalize();
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(\`MinePanel Backend Rodando na porta \${PORT}\`));`;
-
-  const frontendHtml = `<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${config.serverName} | Painel Pro</title>
-    <link rel="stylesheet" href="style.css">
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
-</head>
-<body class="dark">
-    <!-- Tela de Login -->
-    <div id="login-screen" class="screen">
-        <div class="login-card">
-            <div class="brand">
-                <i data-lucide="shield-check" class="emerald"></i>
-                <h1>Mine<span>Panel</span></h1>
-            </div>
-            <p>Seja bem-vindo. Insira suas credenciais.</p>
-            <div class="input-group">
-                <input type="text" id="user" placeholder="Usuário Admin">
-                <input type="password" id="pass" placeholder="Senha Mestre">
-            </div>
-            <button onclick="login()" class="btn-primary">Acessar Painel</button>
-        </div>
-    </div>
-
-    <!-- Painel Principal -->
-    <div id="main-screen" class="screen hidden">
-        <aside class="sidebar">
-            <div class="logo">MINE<span>PANEL</span></div>
-            <nav>
-                <div class="nav-item active" onclick="showTab('dash')"><i data-lucide="layout"></i> Dashboard</div>
-                <div class="nav-item" onclick="showTab('files')"><i data-lucide="folder-open"></i> Arquivos</div>
-                <div class="nav-item" onclick="showTab('mods')"><i data-lucide="box"></i> Modpacks</div>
-                <div class="nav-item" onclick="showTab('backup')"><i data-lucide="save"></i> Backups</div>
-            </nav>
-            <div class="logout" onclick="logout()"><i data-lucide="log-out"></i> Encerrar Sessão</div>
-        </aside>
-
-        <main class="content">
-            <!-- Aba Dashboard -->
-            <section id="tab-dash" class="tab-content active">
-                <div class="content-header">
-                    <h2>Visão Geral</h2>
-                    <div id="server-status" class="status-badge offline">OFFLINE</div>
-                </div>
-                
-                <div class="grid-stats">
-                    <div class="stat-card">
-                        <label>USO DE CPU</label>
-                        <h3 id="stat-cpu">0.0%</h3>
-                    </div>
-                    <div class="stat-card">
-                        <label>MEMÓRIA RAM</label>
-                        <h3 id="stat-ram">0 MB</h3>
-                    </div>
-                    <div class="stat-card">
-                        <label>JOGADORES</label>
-                        <h3 id="stat-players">-</h3>
-                    </div>
-                </div>
-
-                <div class="power-actions">
-                    <button class="btn-pwr btn-start" onclick="power('start')">INICIAR</button>
-                    <button class="btn-pwr btn-stop" onclick="power('stop')">PARAR</button>
-                    <button class="btn-pwr btn-restart" onclick="power('restart')">REINICIAR</button>
-                </div>
-            </section>
-
-            <!-- Aba Arquivos -->
-            <section id="tab-files" class="tab-content">
-                <div class="content-header">
-                    <h2>Gerenciador de Arquivos</h2>
-                    <button class="btn-upload" onclick="triggerUpload()">
-                       <i data-lucide="cloud-upload"></i> Subir Pasta (.zip)
-                    </button>
-                    <input type="file" id="folder-upload" class="hidden" accept=".zip">
-                </div>
-                <div class="file-table-container">
-                    <div id="file-list" class="file-list">
-                         <!-- Itens do diretório via JS -->
-                    </div>
-                </div>
-            </section>
-        </main>
-    </div>
-    <script src="app.js"></script>
-    <script>lucide.createIcons();</script>
-</body>
-</html>`;
-
-  const frontendCss = `/* frontend/style.css */
-:root {
-    --bg: #09090b;
-    --card: #18181b;
-    --accent: #10b981;
-    --accent-hover: #059669;
-    --text: #f4f4f5;
-    --text-dim: #71717a;
-    --border: #27272a;
-}
-
-* { box-sizing: border-box; }
-body { 
-    margin: 0; background: var(--bg); color: var(--text); 
-    font-family: 'Inter', sans-serif; overflow: hidden;
-}
-
-.hidden { display: none !important; }
-
-/* Login */
-.screen { height: 100vh; width: 100vw; display: flex; }
-#login-screen { justify-content: center; align-items: center; background: radial-gradient(circle at top right, #064e3b33, transparent); }
-.login-card { background: var(--card); padding: 3.5rem; border-radius: 2rem; width: 440px; border: 1px solid var(--border); box-shadow: 0 50px 100px -20px rgba(0,0,0,0.5); }
-.brand { display: flex; align-items: center; gap: 1rem; margin-bottom: 2rem; justify-content: center; }
-.brand i { width: 48px; height: 48px; }
-.brand h1 { font-size: 1.8rem; font-weight: 900; color: white; letter-spacing: -1px; margin: 0; }
-.brand span { color: var(--accent); }
-.login-card p { text-align: center; color: var(--text-dim); font-size: 0.9rem; margin-bottom: 2rem; }
-.input-group input { width: 100%; padding: 1.25rem; border-radius: 1rem; background: #00000044; border: 1px solid var(--border); color: white; margin-bottom: 1rem; outline: none; }
-.btn-primary { width: 100%; background: var(--accent); color: #064e3b; padding: 1.25rem; border: none; border-radius: 1rem; font-weight: 900; cursor: pointer; text-transform: uppercase; }
-
-/* Layout Geral */
-.sidebar { width: 280px; background: var(--card); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 2.5rem 0; }
-.logo { font-weight: 900; font-size: 1.5rem; margin-bottom: 3rem; text-align: center; font-style: italic; }
-.logo span { color: var(--accent); }
-.nav-item { padding: 1.25rem 2.5rem; display: flex; align-items: center; gap: 1.25rem; color: var(--text-dim); cursor: pointer; font-weight: 700; transition: 0.2s; border-left: 4px solid transparent; }
-.nav-item.active { background: #27272a; color: white; border-left-color: var(--accent); }
-.nav-item:hover:not(.active) { color: white; }
-.logout { margin-top: auto; padding: 1.25rem 2.5rem; cursor: pointer; color: #ef4444; font-weight: 800; text-transform: uppercase; font-size: 0.75rem; }
-
-.content { flex: 1; padding: 4rem; overflow-y: auto; }
-.content-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3rem; }
-.status-badge { padding: 0.5rem 1.5rem; border-radius: 99px; font-weight: 900; font-size: 0.7rem; border: 1px solid transparent; }
-.status-badge.online { background: #064e3b33; color: var(--accent); border-color: #10b98133; }
-.status-badge.offline { background: #450a0a33; color: #f87171; border-color: #f8717133; }
-
-.grid-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2rem; margin-bottom: 4rem; }
-.stat-card { background: var(--card); padding: 2rem; border-radius: 1.5rem; border: 1px solid var(--border); }
-.stat-card label { font-size: 0.65rem; font-weight: 900; color: var(--text-dim); }
-.power-actions { display: flex; gap: 1.5rem; }
-.btn-pwr { flex: 1; padding: 1.75rem; border-radius: 1.25rem; border: none; font-weight: 900; font-size: 0.85rem; cursor: pointer; transition: 0.3s; }
-.btn-start { background: var(--accent); color: #064e3b; }
-.btn-stop { background: #27272a; color: white; }
-`;
-
-  const nginxConf = `server {
-    listen 80;
-    server_name ${config.domain};
-
-    # Limite de 10GB para facilitar upload de modpacks via painel
-    client_max_body_size 10240M;
-
-    location / {
-        root /var/www/minepanel;
-        index index.html;
-        try_files $uri $uri/ /index.html;
+    // Simular resposta a comandos
+    if (command.toLowerCase() === 'help') {
+      addLog('Comandos disponíveis: help, tps, list, stop, say', 'success');
+    } else if (command.toLowerCase() === 'tps') {
+      addLog('TPS from last 1m, 5m, 15m: 20.0, 19.98, 19.95', 'info');
     }
+  };
 
-    # Proxy reverso para API Node.js
-    location /api/ {
-        proxy_pass http://localhost:${config.backendPort};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-        
-        # Timeouts estendidos para uploads lentos
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
+  const togglePower = () => {
+    if (status === 'online') {
+      setStatus('stopping');
+      addLog('Enviando sinal de encerramento...', 'warn');
+      setTimeout(() => {
+        setStatus('offline');
+        addLog('Servidor desligado com sucesso.', 'error');
+      }, 3000);
+    } else if (status === 'offline') {
+      setStatus('starting');
+      addLog('Iniciando servidor Forge 1.20.1...', 'info');
+      setTimeout(() => {
+        setStatus('online');
+        addLog('Servidor pronto e ouvindo na porta 25565!', 'success');
+      }, 5000);
     }
-}`;
-
-  const readmeInstructions = `# Plano de Implementação MinePanel PRO (VPS Ubuntu 24/Pterodactyl)
-
-Siga este guia para colocar seu painel estilo EnxadaHost no ar em minutos.
-
-### 🐧 1. Preparação da VPS
-Primeiro, vamos instalar o básico na sua VPS:
-\`\`\`bash
-sudo apt update && sudo apt upgrade -y
-# Instale Node.js 20 e Nginx
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs npm nginx unzip
-# Gerenciador de processos para o backend não cair
-sudo npm install -g pm2
-\`\`\`
-
-### 📂 2. Organização de Arquivos
-Crie as pastas para o seu sistema:
-\`\`\`bash
-# Pasta do Backend (Node.js)
-mkdir -p /opt/minepanel/backend
-# Pasta do Frontend (Site)
-mkdir -p /var/www/minepanel
-\`\`\`
-
-### 🔗 3. Configurando o Backend
-\`\`\`bash
-cd /opt/minepanel/backend
-npm init -y
-npm install express axios cors jsonwebtoken fs-extra multer archiver unzipper dotenv
-# Copie o código do server.js e crie seu arquivo .env com os dados deste gerador
-pm2 start server.js --name minepanel
-pm2 save
-\`\`\`
-
-### 🌐 4. Nginx e Segurança (SSL)
-\`\`\`bash
-sudo nano /etc/nginx/sites-available/minepanel
-# Cole a configuração do Nginx gerada ao lado
-sudo ln -s /etc/nginx/sites-available/minepanel /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl restart nginx
-
-# SSL Gratuito com Certbot
-sudo apt install certbot python3-certbot-nginx -y
-sudo certbot --nginx -d ${config.domain}
-\`\`\`
-
-### 🛡️ IMPORTANTE: Permissões de Pasta
-O Pterodactyl roda como usuário \`pterodactyl\`. Para o seu painel conseguir extrair arquivos e fazer backup, você pode precisar ajustar as permissões:
-\`\`\`bash
-# Garante que o painel consiga ler os arquivos do servidor
-sudo chmod -R 775 ${config.vpsPath}
-sudo chown -R $USER:pterodactyl ${config.vpsPath}
-\`\`\`
-`;
+  };
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-slate-300 font-sans selection:bg-emerald-500/30">
-      {/* Background decoration */}
-      <div className="fixed inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-[-5%] right-[-5%] w-[600px] h-[600px] bg-emerald-500/5 rounded-full blur-[140px]" />
-        <div className="absolute bottom-[-5%] left-[-5%] w-[500px] h-[500px] bg-emerald-600/5 rounded-full blur-[120px]" />
-      </div>
+    <div className="flex h-screen bg-[#0f0f0f] text-white overflow-hidden font-sans selection:bg-orange-500/30">
+      
+      {/* Sidebar */}
+      <motion.aside 
+        initial={false}
+        animate={{ width: isSidebarOpen ? 260 : 80 }}
+        className="bg-[#141414] border-r border-white/5 flex flex-col z-20"
+      >
+        <div className="p-6 flex items-center gap-3">
+          <div className="w-8 h-8 bg-orange-600 rounded flex items-center justify-center shrink-0 shadow-lg shadow-orange-900/20">
+            <LayoutDashboard size={18} className="text-white" />
+          </div>
+          {isSidebarOpen && (
+            <motion.span 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="font-bold text-lg tracking-tight"
+            >
+              MinePanel <span className="text-orange-500">Pro</span>
+            </motion.span>
+          )}
+        </div>
 
-      <div className="relative max-w-7xl mx-auto px-6 py-12">
+        <nav className="flex-1 px-3 space-y-1 mt-4">
+          <NavItem active={activeTab === 'console'} onClick={() => setActiveTab('console')} icon={Terminal} label="Console" collapsed={!isSidebarOpen} />
+          <NavItem active={activeTab === 'files'} onClick={() => setActiveTab('files')} icon={Files} label="Arquivos" collapsed={!isSidebarOpen} />
+          <NavItem active={activeTab === 'modpacks'} onClick={() => setActiveTab('modpacks')} icon={Box} label="Modpacks" collapsed={!isSidebarOpen} />
+          <NavItem active={activeTab === 'backups'} onClick={() => setActiveTab('backups')} icon={RotateCcw} label="Backups" collapsed={!isSidebarOpen} />
+          <NavItem active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={Settings} label="Configurações" collapsed={!isSidebarOpen} />
+        </nav>
+
+        <div className="p-4 border-t border-white/5">
+          <div className="flex items-center gap-3 px-2">
+            <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center border border-white/10 overflow-hidden">
+              <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Admin" alt="avatar" />
+            </div>
+            {isSidebarOpen && (
+              <div className="flex-1 overflow-hidden">
+                <div className="text-sm font-medium truncate">Master Admin</div>
+                <div className="text-[10px] text-white/40 uppercase tracking-widest font-mono">Plano Diamond</div>
+              </div>
+            )}
+          </div>
+        </div>
+      </motion.aside>
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col min-w-0">
+        
         {/* Header */}
-        <header className="mb-12 flex flex-col md:flex-row md:items-center justify-between gap-8">
-          <div>
-            <div className="flex items-center gap-4 mb-3">
-              <div className="p-3 bg-emerald-500/10 rounded-2xl border border-emerald-500/20 shadow-lg shadow-emerald-500/10">
-                <Box className="text-emerald-400" size={32} />
-              </div>
-              <div>
-                <h1 className="text-3xl font-black text-white italic tracking-tighter uppercase leading-none">
-                  MinePanel <span className="text-emerald-500">PRO</span>
-                </h1>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-[10px] bg-emerald-500 text-black px-2 py-0.5 rounded-md font-bold tracking-widest">v2.1</span>
-                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">— Start Over Edition</span>
-                </div>
-              </div>
+        <header className="h-16 border-b border-white/5 bg-[#141414]/50 backdrop-blur-md flex items-center justify-between px-8 z-10">
+          <div className="flex items-center gap-6">
+            <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-white/5 rounded-lg transition-colors text-white/60">
+              <Menu size={20} />
+            </button>
+            <div className="flex items-center gap-2">
+              <span className="text-white/40 text-sm">Meu Servidor</span>
+              <ChevronRight size={14} className="text-white/20" />
+              <span className="text-sm font-medium">Survival SMP</span>
             </div>
           </div>
-          
-          <div className="flex items-center gap-2 p-1.5 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl">
-             {[
-               { id: 'config', label: '1. Config', icon: Settings },
-               { id: 'backend', label: '2. Backend', icon: Terminal },
-               { id: 'frontend', label: '3. Frontend', icon: Globe },
-               { id: 'infra', label: '4. Infra', icon: ShieldCheck },
-               { id: 'readme', label: '5. Manual', icon: FileCode }
-             ].map((tab) => (
-               <button
-                 key={tab.id}
-                 onClick={() => setActiveTab(tab.id as any)}
-                 className={`flex items-center gap-2 px-5 py-3 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all ease-out duration-300 ${
-                   activeTab === tab.id 
-                    ? 'bg-emerald-500 text-black shadow-xl shadow-emerald-500/20 scale-105' 
-                    : 'text-slate-500 hover:text-slate-200 hover:bg-white/5'
-                 }`}
-               >
-                 <tab.icon size={14} />
-                 <span className="hidden lg:inline">{tab.label}</span>
-               </button>
-             ))}
+
+          <div className="flex items-center gap-4">
+            <div className="hidden md:flex items-center gap-3 px-4 py-1.5 bg-[#1a1a1a] border border-white/5 rounded-full">
+              <div className={`w-2 h-2 rounded-full ${
+                status === 'online' ? 'bg-green-500 animate-pulse' : 
+                status === 'starting' ? 'bg-yellow-500 animate-pulse' : 
+                'bg-red-500'
+              }`} />
+              <span className="text-xs font-medium uppercase tracking-wider text-white/80">
+                {status === 'online' ? 'Servidor Online' : 
+                 status === 'offline' ? 'Fora do Ar' : 
+                 status === 'starting' ? 'Iniciando...' : 'Desligando...'}
+              </span>
+            </div>
+            
+            <div className="flex items-center gap-2 border-l border-white/10 pl-4 ml-2">
+              <button onClick={togglePower} className={`p-2 rounded-lg transition-all ${status === 'offline' ? 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-red-600/10 hover:bg-red-600/20 text-red-500'}`}>
+                {status === 'offline' ? <Power size={18} /> : <StopCircle size={18} />}
+              </button>
+              <button disabled={status === 'offline'} className="p-2 bg-white/5 hover:bg-white/10 rounded-lg transition-colors text-white/60 disabled:opacity-30">
+                <RotateCcw size={18} />
+              </button>
+            </div>
           </div>
         </header>
 
-        <main className="grid grid-cols-1 gap-8">
+        {/* Viewport */}
+        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+          
           <AnimatePresence mode="wait">
-            {activeTab === 'config' && (
-              <motion.div
-                key="config"
-                initial={{ opacity: 0, y: 20 }}
+            {activeTab === 'console' && (
+              <motion.div 
+                key="console"
+                initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -20 }}
-                className="grid grid-cols-1 lg:grid-cols-3 gap-8"
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
               >
-                {/* Visual Settings */}
-                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
-                  <SectionHeader icon={Info} title="Info do Servidor" />
-                  <InputGroup 
-                    label="NOME NO PAINEL" 
-                    value={config.serverName} 
-                    onChange={v => setConfig({...config, serverName: v})} 
-                    placeholder="Ex: CraftWorld Forge" 
-                  />
-                  <InputGroup 
-                    label="DOMÍNIO FINAL" 
-                    value={config.domain} 
-                    onChange={v => setConfig({...config, domain: v})} 
-                    placeholder="minepaneldashboard.com.br" 
-                  />
-                  <InputGroup 
-                    label="ID DO SERVIDOR (URL)" 
-                    value={config.serverId} 
-                    onChange={v => setConfig({...config, serverId: v})} 
-                    placeholder="Ex: 8f2c3a1b" 
-                  />
+                {/* Metrics Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <MetricCard icon={Cpu} label="Uso de CPU" value="24%" subtext="Cores: 4/12" color="blue" />
+                  <MetricCard icon={Database} label="Uso de RAM" value="3.2 GB" subtext="Limite: 8 GB" color="purple" />
+                  <MetricCard icon={Network} label="Latência" value="12ms" subtext="Porta: 25565" color="green" />
+                  <MetricCard icon={Users} label="Jogadores" value="12/50" subtext="Pico: 34" color="orange" />
                 </div>
 
-                {/* API Settings */}
-                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
-                  <SectionHeader icon={Key} title="Credenciais API" />
-                  <InputGroup 
-                    label="CLIENT API KEY" 
-                    value={config.apiKey} 
-                    onChange={v => setConfig({...config, apiKey: v})} 
-                    placeholder="ptlc_xxxxxxxxxxxxxx" 
-                  />
-                   <InputGroup 
-                    label="PTERODACTYL URL" 
-                    value={config.panelUrl} 
-                    onChange={v => setConfig({...config, panelUrl: v})} 
-                    placeholder="https://pterodactyl.com" 
-                  />
-                  <InputGroup 
-                    label="CAMINHO NA VPS (VOLUMES)" 
-                    value={config.vpsPath} 
-                    onChange={v => setConfig({...config, vpsPath: v})} 
-                    placeholder="/var/lib/pterodactyl/volumes/..." 
-                  />
-                </div>
-
-                {/* Auth Settings */}
-                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
-                  <SectionHeader icon={Lock} title="Acesso & Segurança" />
-                   <div className="grid grid-cols-2 gap-6">
-                    <InputGroup 
-                      label="USUÁRIO" 
-                      value={config.adminUser} 
-                      onChange={v => setConfig({...config, adminUser: v})} 
-                      placeholder="admin" 
-                    />
-                    <InputGroup 
-                      label="PORTA" 
-                      value={config.backendPort} 
-                      onChange={v => setConfig({...config, backendPort: v})} 
-                      placeholder="3000" 
-                    />
+                {/* Charts & Stats */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <div className="lg:col-span-2 bg-[#1a1a1a] border border-white/5 rounded-2xl p-6 h-[400px]">
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="font-semibold text-white/80 flex items-center gap-2">
+                        <Activity size={18} className="text-orange-500" />
+                        Desempenho Histórico
+                      </h3>
+                      <div className="flex gap-2">
+                        <span className="text-[10px] uppercase font-mono text-blue-400 bg-blue-500/10 px-2 py-1 rounded">CPU %</span>
+                        <span className="text-[10px] uppercase font-mono text-purple-400 bg-purple-500/10 px-2 py-1 rounded">RAM %</span>
+                      </div>
+                    </div>
+                    <div className="h-[300px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={metricsData}>
+                          <defs>
+                            <linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
+                              <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                            </linearGradient>
+                            <linearGradient id="colorRam" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#a855f7" stopOpacity={0.3}/>
+                              <stop offset="95%" stopColor="#a855f7" stopOpacity={0}/>
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" vertical={false} />
+                          <XAxis dataKey="time" hide />
+                          <YAxis stroke="#555" fontSize={10} axisLine={false} tickLine={false} domain={[0, 100]} />
+                          <Tooltip 
+                            contentStyle={{ backgroundColor: '#141414', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px' }}
+                            itemStyle={{ fontSize: '12px' }}
+                          />
+                          <Area type="monotone" dataKey="cpu" stroke="#3b82f6" fillOpacity={1} fill="url(#colorCpu)" />
+                          <Area type="monotone" dataKey="ram" stroke="#a855f7" fillOpacity={1} fill="url(#colorRam)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
                   </div>
-                  <InputGroup 
-                    label="SENHA DE LOGIN" 
-                    value={config.adminPassword} 
-                    onChange={v => setConfig({...config, adminPassword: v})} 
-                    placeholder="Senha secreta" 
-                    type="password"
-                  />
-                   <InputGroup 
-                    label="JWT SECRET" 
-                    value={config.jwtSecret} 
-                    onChange={v => setConfig({...config, jwtSecret: v})} 
-                    placeholder="Chave para tokens" 
-                    type="password"
-                  />
+
+                  <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl p-6 flex flex-col">
+                    <h3 className="font-semibold text-white/80 mb-6 flex items-center gap-2">
+                      <ShieldCheck size={18} className="text-green-500" />
+                      Status do Daemon
+                    </h3>
+                    <div className="flex-1 space-y-6">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-white/40">Versão do Daemon</span>
+                        <span className="text-sm font-mono text-white/80">v1.14.2</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-white/40">Uptime</span>
+                        <span className="text-sm font-mono text-white/80">14d 02h 55m</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-white/40">Sincronização</span>
+                        <span className="text-sm font-mono text-green-500 flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                          Estável
+                        </span>
+                      </div>
+                      <div className="pt-6 border-t border-white/5">
+                        <div className="text-xs text-white/40 mb-3 uppercase tracking-widest font-mono">Ações Rápidas</div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button className="flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors text-xs font-medium">
+                            <Box size={14} /> Backups
+                          </button>
+                          <button className="flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors text-xs font-medium">
+                            <Settings size={14} /> Props
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Real Console */}
+                <div className="bg-black border border-white/10 rounded-2xl overflow-hidden flex flex-col h-[500px] shadow-2xl">
+                  <div className="bg-[#141414] px-6 py-3 border-b border-white/5 flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-mono text-white/60">
+                      <Terminal size={14} /> /home/container/console
+                    </div>
+                    <div className="flex gap-1.5">
+                      <div className="w-3 h-3 rounded-full bg-red-500/20" />
+                      <div className="w-3 h-3 rounded-full bg-yellow-500/20" />
+                      <div className="w-3 h-3 rounded-full bg-green-500/20" />
+                    </div>
+                  </div>
+                  
+                  <div 
+                    ref={scrollRef}
+                    className="flex-1 p-6 font-mono text-sm overflow-y-auto space-y-1.5 custom-scrollbar bg-[#050505]"
+                  >
+                    {consoleOutput.length === 0 && (
+                      <div className="text-white/20 italic select-none">Nenhuma atividade registrada ainda...</div>
+                    )}
+                    {consoleOutput.map(line => (
+                      <div key={line.id} className="group flex gap-3 animate-in fade-in slide-in-from-left-4 duration-300">
+                        <span className="shrink-0 text-white/20 select-none">{line.timestamp}</span>
+                        <span className={`
+                          ${line.type === 'error' ? 'text-red-400' : ''}
+                          ${line.type === 'warn' ? 'text-yellow-400' : ''}
+                          ${line.type === 'success' ? 'text-green-400' : ''}
+                          ${line.type === 'command' ? 'text-blue-400 font-bold' : 'text-white/80'}
+                        `}>
+                          {line.message}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <form onSubmit={handleCommand} className="p-4 bg-[#141414] border-t border-white/5 flex gap-4">
+                    <div className="flex-1 relative">
+                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-blue-500 font-bold">$</span>
+                      <input 
+                        type="text" 
+                        value={command}
+                        onChange={(e) => setCommand(e.target.value)}
+                        placeholder="Digite um comando para o servidor..." 
+                        className="w-full bg-black border border-white/10 rounded-xl py-3 pl-10 pr-4 text-sm font-mono focus:outline-none focus:border-blue-500/50 transition-colors"
+                      />
+                    </div>
+                    <button type="submit" className="px-6 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl font-medium transition-all shadow-lg shadow-blue-900/20">
+                      Executar
+                    </button>
+                  </form>
                 </div>
               </motion.div>
             )}
 
-            {activeTab === 'backend' && (
-              <motion.div
-                key="backend"
+            {activeTab === 'files' && (
+              <motion.div 
+                key="files"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-6"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <h2 className="text-2xl font-bold">Gerenciador de Arquivos</h2>
+                    <p className="text-white/50 text-sm">Visualize e gerencie a estrutura de arquivos da sua instância.</p>
+                  </div>
+                  <div className="flex gap-3">
+                    <button className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl transition-colors text-sm">
+                      <Folder size={16} /> Nova Pasta
+                    </button>
+                    <button className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 rounded-xl transition-colors text-sm font-medium shadow-lg shadow-orange-900/20">
+                      <Plus size={16} /> Upload
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl overflow-hidden shadow-xl">
+                  <div className="grid grid-cols-12 gap-4 px-6 py-4 border-b border-white/5 text-[10px] uppercase tracking-widest text-white/40 font-mono">
+                    <div className="col-span-6">Nome</div>
+                    <div className="col-span-2">Tamanho</div>
+                    <div className="col-span-3">Modificado em</div>
+                    <div className="col-span-1 text-right">Ação</div>
+                  </div>
+
+                  <div className="divide-y divide-white/5">
+                    {MOCK_FILES.map((file, idx) => (
+                      <div key={idx} className="grid grid-cols-12 gap-4 px-6 py-4 items-center hover:bg-white/[0.02] cursor-pointer group transition-colors">
+                        <div className="col-span-6 flex items-center gap-3">
+                          {file.type === 'directory' ? <Folder className="text-orange-500" size={18} /> : <FileText className="text-white/40" size={18} />}
+                          <span className="text-sm font-medium group-hover:text-orange-400 transition-colors">{file.name}</span>
+                        </div>
+                        <div className="col-span-2 text-sm text-white/40 font-mono">{file.size}</div>
+                        <div className="col-span-3 text-sm text-white/40 font-mono">{file.modified}</div>
+                        <div className="col-span-1 flex justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button className="p-2 hover:bg-red-500/10 text-red-500 rounded-lg transition-colors">
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'modpacks' && (
+              <motion.div 
+                key="modpacks"
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 1.05 }}
                 className="space-y-8"
               >
-                <CodeBlock 
-                  title=".env (Arquivo de Configuração)" 
-                  content={envExample} 
-                  language="plaintext" 
-                  onCopy={() => handleCopy(envExample, 'env')}
-                  isCopied={copied === 'env'}
-                />
-                <CodeBlock 
-                  title="backend/server.js (Node.js API)" 
-                  content={serverJsContent} 
-                  language="javascript" 
-                  onCopy={() => handleCopy(serverJsContent, 'serverjs')}
-                  isCopied={copied === 'serverjs'}
-                />
-              </motion.div>
-            )}
+                <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+                  <div className="space-y-1">
+                    <h2 className="text-2xl font-bold">Mercado de Modpacks</h2>
+                    <p className="text-white/50 text-sm">Instalação de modpacks em um clique diretamente dos repositórios oficiais.</p>
+                  </div>
+                  <div className="w-full md:w-96 relative">
+                    <Search size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                    <input 
+                      type="text" 
+                      placeholder="Pesquisar modpacks (ex: SkyBlock)..." 
+                      className="w-full bg-[#1a1a1a] border border-white/10 rounded-2xl py-3 pl-12 pr-4 text-sm focus:outline-none focus:border-orange-500/50 transition-all"
+                    />
+                  </div>
+                </div>
 
-            {activeTab === 'frontend' && (
-              <motion.div
-                key="frontend"
-                initial={{ opacity: 0, x: 50 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -50 }}
-                className="space-y-8"
-              >
-                <CodeBlock 
-                  title="frontend/index.html (Página do Painel)" 
-                  content={frontendHtml} 
-                  language="html" 
-                  onCopy={() => handleCopy(frontendHtml, 'html')}
-                  isCopied={copied === 'html'}
-                />
-                <CodeBlock 
-                  title="frontend/style.css (Design Escuro)" 
-                  content={frontendCss} 
-                  language="css" 
-                  onCopy={() => handleCopy(frontendCss, 'css')}
-                  isCopied={copied === 'css'}
-                />
-              </motion.div>
-            )}
-
-            {activeTab === 'infra' && (
-              <motion.div
-                key="infra"
-                initial={{ opacity: 0, y: 50 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -50 }}
-                className="space-y-8"
-              >
-                <CodeBlock 
-                  title="Configuração do Nginx (/etc/nginx/sites-available/minepanel)" 
-                  content={nginxConf} 
-                  language="nginx" 
-                  onCopy={() => handleCopy(nginxConf, 'nginx')}
-                  isCopied={copied === 'nginx'}
-                />
-              </motion.div>
-            )}
-
-            {activeTab === 'readme' && (
-              <motion.div
-                key="readme"
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 1.1 }}
-                className="space-y-6"
-              >
-                <CodeBlock 
-                  title="Manual de Instalação Completo (Portugês)" 
-                  content={readmeInstructions} 
-                  language="markdown" 
-                  onCopy={() => handleCopy(readmeInstructions, 'readme')}
-                  isCopied={copied === 'readme'}
-                />
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                  {MOCK_MODPACKS.map(pack => (
+                    <div key={pack.id} className="bg-[#1a1a1a] border border-white/5 rounded-2xl overflow-hidden group hover:border-orange-500/30 transition-all hover:shadow-2xl hover:shadow-orange-900/10 flex flex-col">
+                      <div className="relative h-48 overflow-hidden bg-slate-800">
+                        <img 
+                          src={pack.logo} 
+                          alt={pack.name} 
+                          className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500 opacity-80"
+                        />
+                        <div className="absolute inset-0 bg-gradient-to-t from-[#1a1a1a] to-transparent" />
+                        <div className="absolute bottom-4 left-4 right-4 flex justify-between items-end">
+                          <div className="px-2 py-1 bg-black/50 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest text-orange-400 border border-orange-500/20">
+                            {pack.vendor}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="p-5 space-y-4 flex-1 flex flex-col">
+                        <div>
+                          <h4 className="font-bold text-lg leading-tight mb-1">{pack.name}</h4>
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs text-white/30">{pack.version}</span>
+                            <span className="text-xs text-white/30 flex items-center gap-1">
+                              <Download size={12} /> {pack.downloads}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="pt-4 mt-auto">
+                          <button className="w-full py-3 bg-white/5 hover:bg-orange-600 rounded-xl transition-all font-semibold text-xs uppercase tracking-widest flex items-center justify-center gap-2">
+                            Instalar Modpack
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  
+                  {/* Custom Install */}
+                  <div className="bg-transparent border border-dashed border-white/10 rounded-2xl p-6 flex flex-col items-center justify-center text-center space-y-4 hover:border-orange-500/40 hover:bg-orange-500/[0.02] transition-all cursor-pointer group">
+                    <div className="w-12 h-12 bg-white/5 group-hover:bg-orange-500/10 rounded-full flex items-center justify-center text-white/30 group-hover:text-orange-500 transition-colors">
+                      <Download size={24} />
+                    </div>
+                    <div>
+                      <h4 className="font-bold">Instalação Custom</h4>
+                      <p className="text-xs text-white/30 mt-1">Envie seu próprio .zip de modpack</p>
+                    </div>
+                  </div>
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
-        </main>
-
-        <footer className="mt-24 border-t border-white/5 pt-16 flex flex-col lg:flex-row items-center justify-between gap-12 pb-16">
-          <div className="flex flex-wrap items-center justify-center gap-10">
-            <span className="text-[10px] font-black uppercase text-slate-600 tracking-[0.2em]">Pterodactyl API v1</span>
-            <span className="text-[10px] font-black uppercase text-slate-600 tracking-[0.2em]">Node.js FS Integration</span>
-            <span className="text-[10px] font-black uppercase text-slate-600 tracking-[0.2em]">JWT Secure Session</span>
-          </div>
-          <div className="text-[11px] font-black text-slate-700 uppercase tracking-[0.4em] flex items-center gap-4">
-            <Monitor size={14} className="text-emerald-500/20" /> MINEPANEL-CORE / 2026-REBOOT
-          </div>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
-function SectionHeader({ icon: Icon, title }: { icon: any, title: string }) {
-  return (
-    <div className="flex items-center gap-3 mb-4">
-      <Icon size={18} className="text-emerald-400" />
-      <h2 className="text-[10px] font-black text-white uppercase italic tracking-[0.25em]">{title}</h2>
-    </div>
-  );
-}
-
-function InputGroup({ label, value, onChange, placeholder, type = "text" }: { label: string, value: string, onChange: (v: string) => void, placeholder: string, type?: string }) {
-  return (
-    <div className="flex flex-col gap-3 group">
-      <label className="text-[10px] font-black text-slate-600 uppercase tracking-[0.15em] group-focus-within:text-emerald-500 transition-colors uppercase italic">{label}</label>
-      <input 
-        type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="bg-black/50 border border-white/5 rounded-2xl px-6 py-4.5 text-sm text-white outline-none focus:border-emerald-500/40 focus:ring-8 focus:ring-emerald-500/5 transition-all placeholder:text-slate-800 font-medium tracking-wide shadow-inner"
-      />
-    </div>
-  );
-}
-
-function CodeBlock({ title, content, language, onCopy, isCopied }: { title: string, content: string, language: string, onCopy: () => void, isCopied: boolean }) {
-  return (
-    <div className="bg-[#0f0f12] border border-white/10 rounded-[2rem] overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.5)] group flex flex-col">
-      <div className="px-10 py-6 bg-[#141417] border-b border-white/10 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex gap-2 mr-3">
-            <div className="w-3 h-3 rounded-full bg-red-500/20 border border-red-500/40" />
-            <div className="w-3 h-3 rounded-full bg-amber-500/20 border border-amber-500/40" />
-            <div className="w-3 h-3 rounded-full bg-emerald-500/20 border border-emerald-500/40" />
-          </div>
-          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest italic flex items-center gap-2">
-            <FileCode size={12} /> {title}
-          </span>
         </div>
-        <button 
-          onClick={onCopy}
-          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-[10px] font-black tracking-widest transition-all duration-300 ${
-            isCopied ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/30' : 'bg-white/5 text-slate-400 hover:text-white hover:bg-emerald-500/30'
-          }`}
-        >
-          {isCopied ? <Check size={14} /> : <Copy size={14} />}
-          {isCopied ? 'COPIADO' : 'COPIAR'}
-        </button>
-      </div>
-      <div className="p-10 overflow-hidden bg-black/40">
-        <pre className="text-xs font-mono text-emerald-400/80 leading-relaxed overflow-x-auto custom-scrollbar">
-          <code>{content}</code>
-        </pre>
-      </div>
+      </main>
+
+      {/* Mini Status Bar (Bottom) */}
+      <footer className="fixed bottom-0 left-0 right-0 h-8 bg-[#0a0a0a] border-t border-white/5 flex items-center justify-between px-6 text-[10px] font-mono text-white/30 z-30">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-2">
+            <div className={`w-1.5 h-1.5 rounded-full ${status === 'online' ? 'bg-green-500' : 'bg-red-500'}`} />
+            DAEMON: ESTÁVEL
+          </div>
+          <div className="hidden sm:block">UPTIME: 14:02:55:12</div>
+          <div className="hidden sm:block">SERVER IP: 144.22.10.45:25565</div>
+        </div>
+        <div className="flex items-center gap-4 uppercase tracking-widest">
+          <span>Mem: 3.2GB / 8GB</span>
+          <span className="text-orange-500/60 transition-pulse">Sync Active</span>
+        </div>
+      </footer>
     </div>
+  );
+}
+
+// --- Componentes Auxiliares UI ---
+
+function NavItem({ icon: Icon, label, active, onClick, collapsed }: any) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`
+        w-full flex items-center gap-4 px-4 py-3.5 rounded-xl transition-all group relative
+        ${active ? 'bg-orange-600 text-white shadow-lg shadow-orange-900/20' : 'text-white/40 hover:text-white/80 hover:bg-white/5'}
+      `}
+    >
+      <Icon size={20} className={active ? 'text-white' : 'text-white/20 group-hover:text-white/60 transition-colors'} />
+      {!collapsed && (
+        <span className="text-sm font-medium transition-opacity">{label}</span>
+      )}
+      {active && collapsed && (
+        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-1 h-6 bg-white rounded-l-full" />
+      )}
+    </button>
   );
 }

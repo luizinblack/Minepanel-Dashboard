@@ -1,6 +1,6 @@
 {
-  "name": "MinePanel Pro Generator",
-  "description": "Gerador completo de painel estilo EnxadaHost para Minecraft: Controle de energia, Gerenciador de Arquivos, Instalador de Modpacks e Backup via API Pterodactyl.",
+  "name": "MinePanel Pro",
+  "description": "Painel premium para gerenciamento de servidores Minecraft com interface intuitiva e recursos avançados.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
