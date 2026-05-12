@@ -1,6 +1,6 @@
 {
-  "name": "Minecraft VPS Deployer",
-  "description": "Ferramenta para gerar scripts de deploy automatizado de servidores Minecraft Forge via GitHub e Pterodactyl API.",
+  "name": "Custom Minecraft Dashboard Generator",
+  "description": "Gerador de painel web personalizado para controle de servidores Minecraft via Pterodactyl API, incluindo Backend Node.js, Frontend e scripts de configuração VPS.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
