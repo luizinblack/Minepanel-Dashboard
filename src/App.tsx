@@ -14,7 +14,14 @@ import {
   Globe,
   Monitor,
   Activity,
-  Key
+  Key,
+  FolderOpen,
+  CloudUpload,
+  Box,
+  Save,
+  Download,
+  AlertTriangle,
+  ChevronDown
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -24,23 +31,29 @@ interface Config {
   panelUrl: string;
   serverId: string;
   apiKey: string;
-  dashboardPassword: string;
-  vpsIp: string;
+  vpsPath: string;
+  adminUser: string;
+  adminPassword: string;
+  jwtSecret: string;
+  curseForgeKey: string;
   domain: string;
   backendPort: string;
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'config' | 'frontend' | 'backend' | 'infra' | 'readme'>('config');
+  const [activeTab, setActiveTab] = useState<'config' | 'backend' | 'frontend' | 'infra' | 'readme'>('config');
   const [copied, setCopied] = useState<string | null>(null);
 
   const [config, setConfig] = useState<Config>({
-    serverName: 'Meu Servidor Forge',
-    panelUrl: 'https://painel.meudominio.com',
-    serverId: 'id_da_url_aqui',
-    apiKey: 'seu_client_api_key_aqui',
-    dashboardPassword: 'senha_secreta',
-    vpsIp: '123.123.123.123',
+    serverName: 'Meu Servidor Modpack',
+    panelUrl: 'https://ptero.meudominio.com',
+    serverId: 'id_aqui',
+    apiKey: 'ptlc_chave_aqui',
+    vpsPath: '/var/lib/pterodactyl/volumes/id_aqui',
+    adminUser: 'admin',
+    adminPassword: 'senha_segura_123',
+    jwtSecret: 'secreta_muito_longa_e_aleatoria',
+    curseForgeKey: 'cf_api_key_opcional',
     domain: 'minepaneldashboard.com.br',
     backendPort: '3000'
   });
@@ -53,311 +66,392 @@ export default function App() {
 
   // --- Generated Content ---
 
-  const envExample = `# Configurações do Pterodactyl
+  const envExample = `# Pterodactyl Link
 PTERODACTYL_URL=\${config.panelUrl}
 PTERODACTYL_API_KEY=\${config.apiKey}
 SERVER_ID=\${config.serverId}
+SERVER_PATH=\${config.vpsPath}
 
-# Configurações do Painel Customizado
-PAINEL_PASSWORD=\${config.dashboardPassword}
+# Painel Auth
+ADMIN_USER=\${config.adminUser}
+ADMIN_PASSWORD=\${config.adminPassword}
+JWT_SECRET=\${config.jwtSecret}
+
+# Extras
 PORT=\${config.backendPort}
+CURSEFORGE_API_KEY=\${config.curseForgeKey}
 NODE_ENV=production`;
 
   const serverJsContent = `// backend/server.js
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const fs = require('fs-extra');
+const path = require('path');
+const multer = require('multer');
+const archiver = require('archiver');
+const unzipper = require('unzipper');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
+const SERVER_PATH = process.env.SERVER_PATH;
 const PTERO_URL = process.env.PTERODACTYL_URL;
 const API_KEY = process.env.PTERODACTYL_API_KEY;
 const SERVER_ID = process.env.SERVER_ID;
-const ADMIN_PASSWORD = process.env.PAINEL_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// Middleware de Autenticação
-const authMiddleware = (req, res, next) => {
-    const password = req.headers['x-panel-password'];
-    if (password === ADMIN_PASSWORD) {
+// --- Middlewares ---
+const authenticate = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Não autenticado' });
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded;
         next();
-    } else {
-        res.status(401).json({ error: 'Senha incorreta' });
+    } catch (err) {
+        res.status(401).json({ error: 'Sessão inválida' });
     }
 };
 
-const pteroClient = axios.create({
+// --- Auth Routes ---
+app.post('/api/login', (req, res) => {
+    const { user, password } = req.body;
+    if (user === process.env.ADMIN_USER && password === process.env.ADMIN_PASSWORD) {
+        const token = jwt.sign({ user }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token });
+    } else {
+        res.status(401).json({ error: 'Usuário ou senha incorretos' });
+    }
+});
+
+// --- Pterodactyl Proxy ---
+const ptero = axios.create({
     baseURL: \`\${PTERO_URL}/api/client/servers/\${SERVER_ID}\`,
-    headers: {
-        'Authorization': \`Bearer \${API_KEY}\`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
+    headers: { 'Authorization': \`Bearer \${API_KEY}\` }
 });
 
-// GET /status - Retorna status, CPU, RAM e players
-app.get('/api/status', async (req, res) => {
+app.get('/api/status', authenticate, async (req, res) => {
     try {
-        const response = await pteroClient.get('/resources');
-        const data = response.data.attributes;
-        res.json({
-            status: data.current_state,
-            is_online: data.current_state === 'running',
-            memory: \`\${(data.resources.memory_bytes / 1024 / 1024).toFixed(0)} MB\`,
-            cpu: \`\${data.resources.cpu_absolute.toFixed(1)}%\`
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Erro ao conectar com Pterodactyl' });
-    }
+        const { data } = await ptero.get('/resources');
+        res.json(data.attributes);
+    } catch (e) { res.status(500).json({ error: 'Pterodactyl offline' }); }
 });
 
-// POST /power - Iniciar ou Parar (Requer Senha)
-app.post('/api/power', authMiddleware, async (req, res) => {
-    const { action } = req.body; // 'start', 'stop', 'restart'
+app.post('/api/power', authenticate, async (req, res) => {
     try {
-        await pteroClient.post('/power', { signal: action });
-        res.json({ success: true, message: \`Sinal \${action} enviado!\` });
-    } catch (error) {
-        res.status(500).json({ error: 'Erro ao enviar comando de energia' });
-    }
+        await ptero.post('/power', { signal: req.body.signal });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Falha no comando' }); }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(\`Backend rodando na porta \${PORT}\`);
-});`;
+// --- File Manager ---
+app.get('/api/files/list', authenticate, async (req, res) => {
+    const relativePath = req.query.path || '';
+    const fullPath = path.join(SERVER_PATH, relativePath);
+    try {
+        const items = await fs.readdir(fullPath, { withFileTypes: true });
+        const list = items.map(item => ({
+            name: item.name,
+            isDirectory: item.isDirectory(),
+            size: item.isDirectory() ? 0 : fs.statSync(path.join(fullPath, item.name)).size
+        }));
+        res.json(list);
+    } catch (e) { res.status(500).json({ error: 'Caminho não encontrado' }); }
+});
+
+app.get('/api/files/read', authenticate, async (req, res) => {
+    const fullPath = path.join(SERVER_PATH, req.query.path);
+    try {
+        const content = await fs.readFile(fullPath, 'utf8');
+        res.json({ content });
+    } catch (e) { res.status(500).json({ error: 'Erro ao ler arquivo' }); }
+});
+
+app.post('/api/files/save', authenticate, async (req, res) => {
+    const fullPath = path.join(SERVER_PATH, req.body.path);
+    try {
+        await fs.writeFile(fullPath, req.body.content);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Erro ao salvar' }); }
+});
+
+// --- Upload de Pasta (ZIP) ---
+const upload = multer({ dest: 'uploads/' });
+app.post('/api/upload-folder', authenticate, upload.single('file'), async (req, res) => {
+    try {
+        await fs.createReadStream(req.file.path)
+            .pipe(unzipper.Extract({ path: SERVER_PATH }))
+            .promise();
+        await fs.remove(req.file.path);
+        res.json({ success: true, message: 'Arquivos extraídos!' });
+    } catch (e) { res.status(500).json({ error: 'Falha no upload/extração' }); }
+});
+
+// --- Backups ---
+app.post('/api/backup/create', authenticate, async (req, res) => {
+    const worldPath = path.join(SERVER_PATH, 'world');
+    const backupName = \`world-backup-\${new Date().getTime()}.zip\`;
+    const outputPath = path.join(SERVER_PATH, '..', 'backups', backupName);
+    
+    await fs.ensureDir(path.join(SERVER_PATH, '..', 'backups'));
+    const output = fs.createWriteStream(outputPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    output.on('close', () => res.json({ success: true, name: backupName }));
+    archive.pipe(output);
+    archive.directory(worldPath, 'world');
+    archive.finalize();
+});
+
+app.listen(process.env.PORT, '0.0.0.0', () => console.log('Painel Pro Ativo!'));`;
 
   const frontendHtml = `<!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>\${config.serverName} | Painel</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
-    <style>
-        :root { --bg: #0c0a09; --card: #1c1917; --primary: #10b981; --online: #10b981; --offline: #ef4444; }
-        body { font-family: 'Inter', sans-serif; background: var(--bg); color: #e7e5e4; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .container { background: var(--card); padding: 2.5rem; border-radius: 1.5rem; width: 100%; max-width: 420px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.8); text-align: center; border: 1px solid rgba(255,255,255,0.03); }
-        h1 { margin: 0; font-size: 1.75rem; font-weight: 900; letter-spacing: -0.05em; text-transform: uppercase; font-style: italic; color: white; }
-        .status-badge { display: inline-block; padding: 0.6rem 1.2rem; border-radius: 99px; font-size: 0.7rem; font-weight: 900; margin: 2rem 0; text-transform: uppercase; letter-spacing: 0.1em; }
-        .online { background: rgba(16, 185, 129, 0.1); color: var(--online); border: 1px solid rgba(16, 185, 129, 0.2); }
-        .offline { background: rgba(239, 68, 68, 0.1); color: var(--offline); border: 1px solid rgba(239, 68, 68, 0.2); }
-        .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 2.5rem; }
-        .stat-item { background: rgba(0,0,0,0.3); padding: 1.25rem; border-radius: 1rem; border: 1px solid rgba(255,255,255,0.02); }
-        .stat-label { font-size: 0.65rem; color: #78716c; text-transform: uppercase; font-weight: 900; margin-bottom: 0.5rem; }
-        .stat-value { font-size: 1.25rem; font-weight: 700; color: white; }
-        .actions { display: flex; flex-direction: column; gap: 1rem; }
-        button { border: none; padding: 1.1rem; border-radius: 1rem; font-weight: 900; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
-        .btn-start { background: var(--primary); color: #064e3b; }
-        .btn-stop { background: #292524; color: #a8a29e; }
-        button:hover { transform: translateY(-3px); box-shadow: 0 10px 20px -5px rgba(16, 185, 129, 0.3); }
-        .btn-stop:hover { box-shadow: 0 10px 20px -5px rgba(0,0,0,0.5); }
-        .password-input { width: 100%; padding: 1.1rem; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.05); border-radius: 1rem; color: white; box-sizing: border-box; margin-bottom: 1.5rem; text-align: center; outline: none; transition: border-color 0.2s; }
-        .password-input:focus { border-color: var(--primary); }
-    </style>
+    <title>\${config.serverName} | Painel Pro</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://unpkg.com/lucide@latest"></script>
 </head>
-<body>
-    <div class="container">
-        <h1>\${config.serverName}</h1>
-        <div id="status" class="status-badge offline">Carregando...</div>
-        
-        <div class="stats">
-            <div class="stat-item">
-                <div class="stat-label">CPU</div>
-                <div id="cpu" class="stat-value">-</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-label">RAM</div>
-                <div id="ram" class="stat-value">-</div>
-            </div>
-        </div>
-
-        <input type="password" id="password" class="password-input" placeholder="DIGITE A SENHA DO PAINEL">
-        
-        <div class="actions">
-            <button class="btn-start" onclick="power('start')">Iniciar Servidor</button>
-            <button class="btn-stop" onclick="power('stop')">Desligar Servidor</button>
+<body class="dark">
+    <div id="login-screen" class="screen">
+        <div class="login-card">
+            <i data-lucide="shield-check" class="brand-icon"></i>
+            <h1>Área Restrita</h1>
+            <input type="text" id="user" placeholder="Usuário">
+            <input type="password" id="pass" placeholder="Senha">
+            <button onclick="login()">Acessar Painel</button>
         </div>
     </div>
 
-    <script>
-        const API_BASE = window.location.origin + '/api';
+    <div id="main-screen" class="screen hidden">
+        <aside class="sidebar">
+            <div class="logo">MINE<span>PANEL</span></div>
+            <nav>
+                <div class="nav-item active" onclick="showTab('dash')"><i data-lucide="layout"></i> Dashboard</div>
+                <div class="nav-item" onclick="showTab('files')"><i data-lucide="folder-open"></i> Arquivos</div>
+                <div class="nav-item" onclick="showTab('mods')"><i data-lucide="box"></i> Modpacks</div>
+                <div class="nav-item" onclick="showTab('backup')"><i data-lucide="save"></i> Backups</div>
+            </nav>
+            <div class="logout" onclick="logout()"><i data-lucide="log-out"></i> Sair</div>
+        </aside>
 
-        const updateStatus = async () => {
-            try {
-                const res = await fetch(API_BASE + '/status');
-                const data = await res.json();
-                const badge = document.getElementById('status');
-                badge.textContent = data.status === 'running' ? 'ESTADO: ONLINE' : 'ESTADO: ' + data.status.toUpperCase();
-                badge.className = 'status-badge ' + (data.status === 'running' ? 'online' : 'offline');
-                document.getElementById('cpu').textContent = data.cpu;
-                document.getElementById('ram').textContent = data.memory;
-            } catch (e) { console.error('Erro ao buscar status'); }
-        };
+        <main class="content">
+            <section id="tab-dash" class="tab-content active">
+                <div class="header">
+                    <h2>Dashboard</h2>
+                    <div id="server-status" class="status-indicator">OFFLINE</div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-card"><span>CPU</span><h3 id="stat-cpu">-</h3></div>
+                    <div class="stat-card"><span>RAM</span><h3 id="stat-ram">-</h3></div>
+                </div>
+                <div class="power-controls">
+                    <button class="btn-start" onclick="power('start')">Ligar</button>
+                    <button class="btn-stop" onclick="power('stop')">Desligar</button>
+                    <button class="btn-restart" onclick="power('restart')">Reiniciar</button>
+                </div>
+            </section>
 
-        const power = async (action) => {
-            const password = document.getElementById('password').value;
-            if(!password) return alert('Insira a senha mestre!');
-            
-            try {
-                const res = await fetch(API_BASE + '/power', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-panel-password': password },
-                    body: JSON.stringify({ action })
-                });
-                const data = await res.json();
-                if(data.error) alert(data.error);
-                else alert(data.message);
-                updateStatus();
-            } catch (e) { alert('Erro na conexão com o backend'); }
-        };
-
-        setInterval(updateStatus, 5000);
-        updateStatus();
-    </script>
+            <section id="tab-files" class="tab-content">
+                <h2>Gerenciador de Arquivos</h2>
+                <div class="file-browser" id="file-list"></div>
+                <div class="file-actions">
+                    <input type="file" id="folder-upload" class="hidden">
+                    <button onclick="document.getElementById('folder-upload').click()">Upload Pasta (.zip)</button>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
 </body>
 </html>`;
+
+  const frontendCss = `/* frontend/style.css */
+:root {
+    --bg: #09090b;
+    --card: #18181b;
+    --accent: #10b981;
+    --text: #f4f4f5;
+}
+
+body { 
+    margin: 0; background: var(--bg); color: var(--text); 
+    font-family: 'Inter', system-ui, sans-serif;
+}
+
+.screen { 
+    height: 100vh; display: flex; align-items: center; justify-content: center;
+}
+
+.hidden { display: none !important; }
+
+/* Sidebar */
+.sidebar {
+    width: 260px; background: var(--card); border-right: 1px solid #27272a;
+    display: flex; flex-direction: column; padding: 2rem 0;
+}
+
+.logo { font-weight: 900; font-size: 1.5rem; text-align: center; margin-bottom: 2rem; }
+.logo span { color: var(--accent); }
+
+.nav-item {
+    padding: 1rem 2rem; cursor: pointer; display: flex; align-items: center; gap: 1rem;
+    color: #71717a; transition: all 0.2s;
+}
+
+.nav-item:hover, .nav-item.active { color: white; background: #27272a; }
+.nav-item.active { border-left: 4px solid var(--accent); }
+
+/* Dashboard */
+.content { flex: 1; padding: 3rem; overflow-y: auto; }
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
+.status-indicator { 
+    padding: 0.5rem 1rem; border-radius: 99px; font-weight: 900; font-size: 0.7rem;
+    background: #450a0a; color: #f87171;
+}
+
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem; }
+.stat-card { background: var(--card); padding: 1.5rem; border-radius: 1rem; border: 1px solid #27272a; }
+.stat-card span { font-size: 0.7rem; color: #71717a; font-weight: 900; }
+
+.power-controls { margin-top: 2rem; display: flex; gap: 1rem; }
+button { 
+    padding: 1rem 2rem; border-radius: 0.75rem; border: none; font-weight: 700;
+    cursor: pointer; transition: 0.2s;
+}
+
+.btn-start { background: var(--accent); color: #064e3b; }
+.btn-stop { background: #3f3f46; color: white; }
+
+/* File Browser */
+.file-browser { background: var(--card); border-radius: 1rem; min-height: 400px; padding: 1rem; }
+`;
 
   const nginxConf = `server {
     listen 80;
     server_name \${config.domain};
 
-    # Servir o Frontend Estático
+    # Limite de 10GB para pastas de modpack
+    client_max_body_size 10240M;
+
     location / {
         root /var/www/minepanel;
         index index.html;
-        try_files $uri $uri/ =404;
+        try_files $uri $uri/ /index.html;
     }
 
-    # Proxy para o Backend Node.js
     location /api/ {
         proxy_pass http://localhost:\${config.backendPort};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Timeout longo para uploads pesados
+        proxy_read_timeout 600s;
+        proxy_connect_timeout 600s;
     }
 }`;
 
-  const systemdService = `[Unit]
-Description=MinePanel Dashboard Backend
-After=network.target
+  const readmeInstructions = `# Manual MinePanel PRO (Estilo EnxadaHost)
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/minepanel/backend
-ExecStart=/usr/bin/node server.js
-Restart=on-failure
-Environment=NODE_ENV=production
-# Opcional: Carregar ENV de arquivo separado
-# EnvironmentFile=/opt/minepanel/backend/.env
+Esta ferramenta gera um sistema de controle completo. Siga os passos:
 
-[Install]
-WantedBy=multi-user.target`;
-
-  const readmeInstructions = `# Plano de Implementação: minepaneldashboard.com.br
-
-### 🚀 1. Setup Inicial da VPS
-Conecte-se na sua VPS Ubuntu 24 e instale o ambiente necessário:
+### 1. Instalação de Dependências
+Na sua VPS Ubuntu 24:
 \`\`\`bash
 sudo apt update && sudo apt upgrade -y
-# Instalar Node.js 20+ e Nginx
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs nginx
+sudo apt install -y nodejs npm nginx unzip
+sudo npm install -g pm2
 \`\`\`
 
-### 📂 2. Estrutura de Pastas
+### 2. Organização
 \`\`\`bash
-sudo mkdir -p /opt/minepanel/backend
-sudo mkdir -p /var/www/minepanel
-sudo chown -R $USER:$USER /opt/minepanel
-sudo chown -R $USER:$USER /var/www/minepanel
+mkdir -p /opt/minepanel/backend
+mkdir -p /var/www/minepanel
 \`\`\`
 
-### ⚙️ 3. Backend (Node.js)
-Abra a pasta do backend, inicie o projeto e crie os arquivos:
-\`\`\`bash
-cd /opt/minepanel/backend
-npm init -y
-npm install express axios dotenv cors
-# Crie o server.js e o .env com os códigos gerados aqui
-\`\`\`
+### 3. Backend Setup
+Vá em \`/opt/minepanel/backend\`:
+1. Copie o **server.js**
+2. Rode \`npm init -y\`
+3. Instale: \`npm install express axios cors jsonwebtoken fs-extra multer archiver unzipper dotenv\`
+4. Configure o **.env**
+5. Inicie com PM2: \`pm2 start server.js --name minepanel\`
 
-### 🌐 4. Frontend & Nginx
-1. Salve o **index.html** em \`/var/www/minepanel/index.html\`
-2. Crie a config do Nginx: \`sudo nano /etc/nginx/sites-available/minepanel\`
-3. Ative a config:
+### 4. Frontend Setup
+Vá em \`/var/www/minepanel\`:
+1. Salve **index.html**, **style.css** e **app.js** (lógica).
+
+### 5. Configuração Nginx & SSL
 \`\`\`bash
+sudo nano /etc/nginx/sites-available/minepanel
+# Cole a configuração do Nginx aqui
 sudo ln -s /etc/nginx/sites-available/minepanel /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl restart nginx
-\`\`\`
+sudo nginx -t && sudo systemctl restart nginx
 
-### 🔒 5. SSL (HTTPS Gratuito)
-\`\`\`bash
+# SSL Gratuito
 sudo apt install certbot python3-certbot-nginx -y
 sudo certbot --nginx -d \${config.domain}
 \`\`\`
 
-### 🔋 6. Persistência (SystemD)
-Crie o serviço para que o painel nunca caia:
+### 🚀 DICA DE OURO: Permissões
+Certifique-se que o usuário que roda o painel tem acesso à pasta do Pterodactyl:
 \`\`\`bash
-sudo nano /etc/systemd/system/minepanel.service
-# Cole o conteúdo do SystemD gerado aqui
-sudo systemctl daemon-reload
-sudo systemctl enable minepanel
-sudo systemctl start minepanel
+sudo chown -R www-data:www-data \${config.vpsPath}
+sudo chmod -R 775 \${config.vpsPath}
 \`\`\`
 `;
 
   return (
-    <div className="min-h-screen bg-[#0c0c0c] text-slate-300 font-sans selection:bg-emerald-500/30">
+    <div className="min-h-screen bg-[#09090b] text-slate-300 font-sans selection:bg-emerald-500/30">
       {/* Background decoration */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-[-10%] right-[-10%] w-[500px] h-[500px] bg-emerald-500/5 rounded-full blur-[120px]" />
-        <div className="absolute bottom-[-10%] left-[-10%] w-[400px] h-[400px] bg-emerald-600/5 rounded-full blur-[100px]" />
+        <div className="absolute top-[-5%] right-[-5%] w-[600px] h-[600px] bg-emerald-500/5 rounded-full blur-[140px]" />
+        <div className="absolute bottom-[-5%] left-[-5%] w-[500px] h-[500px] bg-emerald-600/5 rounded-full blur-[120px]" />
       </div>
 
-      <div className="relative max-w-6xl mx-auto px-6 py-12">
+      <div className="relative max-w-7xl mx-auto px-6 py-12">
         {/* Header */}
         <header className="mb-12 flex flex-col md:flex-row md:items-center justify-between gap-8">
           <div>
-            <div className="flex items-center gap-3 mb-2">
-              <div className="p-2.5 bg-emerald-500/10 rounded-xl border border-emerald-500/20">
-                <Activity className="text-emerald-400" size={24} />
+            <div className="flex items-center gap-4 mb-3">
+              <div className="p-3 bg-emerald-500/10 rounded-2xl border border-emerald-500/20 shadow-lg shadow-emerald-500/10">
+                <Box className="text-emerald-400" size={32} />
               </div>
-              <h1 className="text-2xl font-black text-white italic tracking-tighter uppercase">
-                MinePanel <span className="text-emerald-500">Forge</span> <span className="text-[10px] bg-emerald-500 text-black px-2 py-0.5 rounded-full not-italic ml-2 tracking-normal uppercase font-bold">Dashboard Generator</span>
-              </h1>
+              <div>
+                <h1 className="text-3xl font-black text-white italic tracking-tighter uppercase leading-none">
+                  MinePanel <span className="text-emerald-500">PRO</span>
+                </h1>
+                <div className="flex items-center gap-2 mt-1">
+                  <span className="text-[10px] bg-emerald-500 text-black px-2 py-0.5 rounded-md font-bold tracking-widest">v2.0</span>
+                  <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">— Enxada Style Generator</span>
+                </div>
+              </div>
             </div>
-            <p className="text-slate-500 text-sm font-medium">
-              Gere toda a infraestrutura para o seu painel de controle customizado na VPS.
-            </p>
           </div>
           
-          <div className="flex items-center gap-2 p-1.5 bg-white/5 border border-white/10 rounded-2xl">
+          <div className="flex items-center gap-2 p-1.5 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl">
              {[
-               { id: 'config', label: '1. Config', icon: Settings },
-               { id: 'frontend', label: '2. Frontend', icon: Globe },
-               { id: 'backend', label: '3. Backend', icon: Terminal },
+               { id: 'config', label: '1. Ajustes', icon: Settings },
+               { id: 'backend', label: '2. Backend', icon: Terminal },
+               { id: 'frontend', label: '3. Frontend', icon: Globe },
                { id: 'infra', label: '4. Infra', icon: ShieldCheck },
-               { id: 'readme', label: '5. Manual', icon: FileCode }
+               { id: 'readme', label: '5. Guia', icon: FileCode }
              ].map((tab) => (
                <button
                  key={tab.id}
                  onClick={() => setActiveTab(tab.id as any)}
-                 className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all ease-out duration-300 \${
+                 className={`flex items-center gap-2 px-5 py-3 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all ease-out duration-300 ${
                    activeTab === tab.id 
                     ? 'bg-emerald-500 text-black shadow-xl shadow-emerald-500/20 scale-105' 
-                    : 'text-slate-500 hover:text-slate-300 hover:bg-white/5'
+                    : 'text-slate-500 hover:text-slate-200 hover:bg-white/5'
                  }`}
                >
                  <tab.icon size={14} />
-                 <span className="hidden sm:inline">{tab.label}</span>
+                 <span className="hidden lg:inline">{tab.label}</span>
                </button>
              ))}
           </div>
@@ -371,59 +465,61 @@ sudo systemctl start minepanel
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
-                className="grid grid-cols-1 md:grid-cols-2 gap-8"
+                className="grid grid-cols-1 lg:grid-cols-3 gap-8"
               >
-                <div className="bg-[#111111] border border-white/10 rounded-3xl p-10 space-y-8 shadow-2xl">
-                  <div className="flex items-center gap-3 mb-2">
-                    <Layout size={20} className="text-emerald-400" />
-                    <h2 className="text-xs font-black text-white uppercase italic tracking-[0.2em]">Personalização Visual</h2>
-                  </div>
+                {/* Visual Settings */}
+                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
+                  <SectionHeader icon={Layout} title="Visual & Acesso Web" />
                   <InputGroup 
-                    label="NOME DO SERVIDOR" 
+                    label="NOME NO PAINEL" 
                     value={config.serverName} 
                     onChange={v => setConfig({...config, serverName: v})} 
                     placeholder="Ex: CraftWorld Forge" 
                   />
                   <InputGroup 
-                    label="DOMÍNIO (URL)" 
+                    label="DOMÍNIO FINAL" 
                     value={config.domain} 
                     onChange={v => setConfig({...config, domain: v})} 
                     placeholder="minepaneldashboard.com.br" 
                   />
-                  <InputGroup 
-                    label="SENHA DO DASHBOARD" 
-                    value={config.dashboardPassword} 
-                    onChange={v => setConfig({...config, dashboardPassword: v})} 
-                    placeholder="Defina uma senha forte" 
-                    type="password"
-                  />
-                </div>
-
-                <div className="bg-[#111111] border border-white/10 rounded-3xl p-10 space-y-8 shadow-2xl">
-                  <div className="flex items-center gap-3 mb-2">
-                    <Key size={20} className="text-emerald-400" />
-                    <h2 className="text-xs font-black text-white uppercase italic tracking-[0.2em]">Credenciais Pterodactyl</h2>
-                  </div>
-                  <InputGroup 
-                    label="URL DO PAINEL" 
-                    value={config.panelUrl} 
-                    onChange={v => setConfig({...config, panelUrl: v})} 
-                    placeholder="https://painel.meudominio.com" 
-                  />
-                  <div className="grid grid-cols-2 gap-6">
+                   <div className="grid grid-cols-2 gap-6">
                     <InputGroup 
-                      label="ID DO SERVIDOR" 
-                      value={config.serverId} 
-                      onChange={v => setConfig({...config, serverId: v})} 
-                      placeholder="Ex: 99abc123" 
+                      label="USUÁRIO" 
+                      value={config.adminUser} 
+                      onChange={v => setConfig({...config, adminUser: v})} 
+                      placeholder="admin" 
                     />
                     <InputGroup 
-                      label="PORTA BACKEND" 
+                      label="PAINEL PORT" 
                       value={config.backendPort} 
                       onChange={v => setConfig({...config, backendPort: v})} 
                       placeholder="3000" 
                     />
                   </div>
+                  <InputGroup 
+                    label="SENHA DE ACESSO" 
+                    value={config.adminPassword} 
+                    onChange={v => setConfig({...config, adminPassword: v})} 
+                    placeholder="Senha do site" 
+                    type="password"
+                  />
+                </div>
+
+                {/* API Settings */}
+                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
+                  <SectionHeader icon={Key} title="Conexão Pterodactyl" />
+                  <InputGroup 
+                    label="URL DO PAINEL PTERO" 
+                    value={config.panelUrl} 
+                    onChange={v => setConfig({...config, panelUrl: v})} 
+                    placeholder="https://pterodactyl.com" 
+                  />
+                  <InputGroup 
+                    label="ID DO SERVIDOR (URL)" 
+                    value={config.serverId} 
+                    onChange={v => setConfig({...config, serverId: v})} 
+                    placeholder="Ex: 8f2c3a1b" 
+                  />
                   <InputGroup 
                     label="CLIENT API KEY" 
                     value={config.apiKey} 
@@ -431,59 +527,110 @@ sudo systemctl start minepanel
                     placeholder="ptlc_xxxxxxxxxxxxxx" 
                   />
                 </div>
-              </motion.div>
-            )}
 
-            {activeTab === 'frontend' && (
-              <motion.div
-                key="frontend"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 1.05 }}
-                className="space-y-6"
-              >
-                <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-3xl p-8 flex gap-6 items-center">
-                   <div className="p-4 bg-emerald-500/10 rounded-2xl">
-                     <Monitor size={32} className="text-emerald-500" />
-                   </div>
-                   <div>
-                     <h4 className="text-emerald-500 font-black uppercase text-sm mb-1 tracking-widest italic">Página Web UI</h4>
-                     <p className="text-slate-400 text-sm leading-relaxed max-w-2xl">
-                       Este código gera um arquivo <code className="bg-white/5 px-1.5 py-0.5 rounded text-emerald-400 font-mono">index.html</code> único, contendo CSS moderno e JavaScript para atualização em tempo real de CPU/RAM e controle de energia.
+                {/* System Settings */}
+                <div className="bg-[#121214] border border-white/10 rounded-[2.5rem] p-10 space-y-8 shadow-2xl">
+                  <SectionHeader icon={ShieldCheck} title="Sistema & VPS" />
+                  <InputGroup 
+                    label="CAMINHO NA VPS (VOLUMES)" 
+                    value={config.vpsPath} 
+                    onChange={v => setConfig({...config, vpsPath: v})} 
+                    placeholder="/var/lib/pterodactyl/volumes/..." 
+                  />
+                  <InputGroup 
+                    label="JWT SECRET (TOKEN)" 
+                    value={config.jwtSecret} 
+                    onChange={v => setConfig({...config, jwtSecret: v})} 
+                    placeholder="Uma chave longa aleatória" 
+                  />
+                  <InputGroup 
+                    label="CURSEFORGE API KEY" 
+                    value={config.curseForgeKey} 
+                    onChange={v => setConfig({...config, curseForgeKey: v})} 
+                    placeholder="Cozinha opcional" 
+                  />
+                  <div className="p-5 bg-amber-500/5 rounded-2xl border border-amber-500/20">
+                     <p className="text-[10px] text-amber-500 leading-relaxed italic">
+                       *O caminho dos volumes é onde o Pterodactyl guarda os arquivos. Geralmente em <code className="bg-black/20 px-1">/var/lib/pterodactyl/volumes/</code>
                      </p>
-                   </div>
+                  </div>
                 </div>
-                <CodeBlock 
-                  title="frontend/index.html (HTML5 + CSS3 + Vanilla JS)" 
-                  content={frontendHtml} 
-                  language="html" 
-                  onCopy={() => handleCopy(frontendHtml, 'html')}
-                  isCopied={copied === 'html'}
-                />
               </motion.div>
             )}
 
             {activeTab === 'backend' && (
               <motion.div
                 key="backend"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 1.05 }}
+                className="space-y-8"
+              >
+                <div className="flex flex-col lg:flex-row gap-6">
+                   <div className="lg:w-1/3">
+                      <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-3xl p-8 sticky top-6">
+                        <SectionHeader icon={Terminal} title="Estrutura do Backend" />
+                        <ul className="mt-6 space-y-4 text-xs">
+                          <li className="flex items-start gap-3">
+                            <Check size={14} className="text-emerald-500 mt-1" />
+                            <span><strong>Auth JWT:</strong> Sessões seguras por 7 dias.</span>
+                          </li>
+                          <li className="flex items-start gap-3">
+                            <Check size={14} className="text-emerald-500 mt-1" />
+                            <span><strong>File Stream:</strong> Gerenciador de arquivos via Node FS.</span>
+                          </li>
+                          <li className="flex items-start gap-3">
+                            <Check size={14} className="text-emerald-500 mt-1" />
+                            <span><strong>Auto-Backup:</strong> Zip da pasta \`world\` em tempo real.</span>
+                          </li>
+                          <li className="flex items-start gap-3">
+                            <Check size={14} className="text-emerald-500 mt-1" />
+                            <span><strong>Zip Upload:</strong> Extração rápida de pastas completas.</span>
+                          </li>
+                        </ul>
+                      </div>
+                   </div>
+                   <div className="lg:w-2/3 space-y-8">
+                      <CodeBlock 
+                        title=".env (Secret)" 
+                        content={envExample} 
+                        language="plaintext" 
+                        onCopy={() => handleCopy(envExample, 'env')}
+                        isCopied={copied === 'env'}
+                      />
+                      <CodeBlock 
+                        title="backend/server.js (API Completa)" 
+                        content={serverJsContent} 
+                        language="javascript" 
+                        onCopy={() => handleCopy(serverJsContent, 'serverjs')}
+                        isCopied={copied === 'serverjs'}
+                      />
+                   </div>
+                </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'frontend' && (
+              <motion.div
+                key="frontend"
                 initial={{ opacity: 0, x: 50 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: -50 }}
-                className="space-y-6"
+                className="space-y-8"
               >
                 <CodeBlock 
-                  title=".env (Variáveis de Ambiente)" 
-                  content={envExample} 
-                  language="plaintext" 
-                  onCopy={() => handleCopy(envExample, 'env')}
-                  isCopied={copied === 'env'}
+                  title="frontend/index.html" 
+                  content={frontendHtml} 
+                  language="html" 
+                  onCopy={() => handleCopy(frontendHtml, 'html')}
+                  isCopied={copied === 'html'}
                 />
                 <CodeBlock 
-                  title="server.js (Node.js API)" 
-                  content={serverJsContent} 
-                  language="javascript" 
-                  onCopy={() => handleCopy(serverJsContent, 'serverjs')}
-                  isCopied={copied === 'serverjs'}
+                  title="frontend/style.css" 
+                  content={frontendCss} 
+                  language="css" 
+                  onCopy={() => handleCopy(frontendCss, 'css')}
+                  isCopied={copied === 'css'}
                 />
               </motion.div>
             )}
@@ -494,21 +641,23 @@ sudo systemctl start minepanel
                 initial={{ opacity: 0, y: 50 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -50 }}
-                className="space-y-6"
+                className="space-y-8"
               >
+                <div className="bg-red-500/5 border border-red-500/20 rounded-3xl p-8 flex gap-6 items-start">
+                  <AlertTriangle className="text-red-500 mt-1" size={24} />
+                  <div>
+                    <h4 className="text-red-500 font-bold uppercase text-xs tracking-widest mb-1">Cuidado com Limites do Nginx</h4>
+                    <p className="text-sm text-slate-400">
+                      Arquivos de modpack podem ser imensos. O parâmetro <code className="bg-white/5 px-1 rounded">client_max_body_size 10240M</code> na configuração abaixo permite até 10GB de upload. Não esqueça de reiniciar o Nginx após aplicar.
+                    </p>
+                  </div>
+                </div>
                 <CodeBlock 
-                  title="Nginx Config - /etc/nginx/sites-available/minepanel" 
+                  title="Nginx VirtualHost (/etc/nginx/sites-available/minepanel)" 
                   content={nginxConf} 
                   language="nginx" 
                   onCopy={() => handleCopy(nginxConf, 'nginx')}
                   isCopied={copied === 'nginx'}
-                />
-                <CodeBlock 
-                  title="SystemD Service - /etc/systemd/system/minepanel.service" 
-                  content={systemdService} 
-                  language="systemd" 
-                  onCopy={() => handleCopy(systemdService, 'systemd')}
-                  isCopied={copied === 'systemd'}
                 />
               </motion.div>
             )}
@@ -516,13 +665,13 @@ sudo systemctl start minepanel
             {activeTab === 'readme' && (
               <motion.div
                 key="readme"
-                initial={{ opacity: 0, scale: 1.1 }}
+                initial={{ opacity: 0, scale: 0.9 }}
                 animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.9 }}
+                exit={{ opacity: 0, scale: 1.1 }}
                 className="space-y-6"
               >
                 <CodeBlock 
-                  title="Manual de Instalação (README.md)" 
+                  title="Guia de Instalação (README.md)" 
                   content={readmeInstructions} 
                   language="markdown" 
                   onCopy={() => handleCopy(readmeInstructions, 'readme')}
@@ -533,14 +682,15 @@ sudo systemctl start minepanel
           </AnimatePresence>
         </main>
 
-        <footer className="mt-24 border-t border-white/5 pt-12 flex flex-col md:flex-row items-center justify-between gap-8 pb-12">
-          <div className="flex items-center gap-10">
-            <a href="#" className="text-[10px] font-black uppercase text-slate-500 hover:text-emerald-400 transition-all tracking-widest">Suporte VPS</a>
-            <a href="#" className="text-[10px] font-black uppercase text-slate-500 hover:text-emerald-400 transition-all tracking-widest">Pterodactyl API</a>
-            <a href="#" className="text-[10px] font-black uppercase text-slate-500 hover:text-emerald-400 transition-all tracking-widest">Segurança SSH</a>
+        <footer className="mt-24 border-t border-white/5 pt-16 flex flex-col lg:flex-row items-center justify-between gap-12 pb-16">
+          <div className="flex flex-wrap items-center justify-center gap-10">
+            <FooterLink label="Pterodacty API Docs" />
+            <FooterLink label="PM2 Management" />
+            <FooterLink label="Nginx Proxying" />
+            <FooterLink label="Security Headers" />
           </div>
-          <div className="text-[11px] font-black text-slate-600 uppercase tracking-[0.3em] flex items-center gap-3">
-            <Activity size={14} className="text-emerald-500/30" /> MinePanel.AI Build 2026
+          <div className="text-[11px] font-black text-slate-700 uppercase tracking-[0.4em] flex items-center gap-4">
+            <Monitor size={14} className="text-emerald-500/20" /> MINEPANEL-PRO-GEN / 2026-STABLE
           </div>
         </footer>
       </div>
@@ -548,16 +698,25 @@ sudo systemctl start minepanel
   );
 }
 
+function SectionHeader({ icon: Icon, title }: { icon: any, title: string }) {
+  return (
+    <div className="flex items-center gap-3 mb-4">
+      <Icon size={18} className="text-emerald-400" />
+      <h2 className="text-[10px] font-black text-white uppercase italic tracking-[0.25em]">{title}</h2>
+    </div>
+  );
+}
+
 function InputGroup({ label, value, onChange, placeholder, type = "text" }: { label: string, value: string, onChange: (v: string) => void, placeholder: string, type?: string }) {
   return (
     <div className="flex flex-col gap-3 group">
-      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest group-focus-within:text-emerald-500 transition-colors">{label}</label>
+      <label className="text-[10px] font-black text-slate-600 uppercase tracking-[0.15em] group-focus-within:text-emerald-500 transition-colors">{label}</label>
       <input 
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm text-white outline-none focus:border-emerald-500/40 focus:ring-4 focus:ring-emerald-500/10 transition-all placeholder:text-slate-800 font-medium"
+        className="bg-black/50 border border-white/5 rounded-2xl px-6 py-4.5 text-sm text-white outline-none focus:border-emerald-500/40 focus:ring-8 focus:ring-emerald-500/5 transition-all placeholder:text-slate-800 font-medium tracking-wide shadow-inner"
       />
     </div>
   );
@@ -565,31 +724,41 @@ function InputGroup({ label, value, onChange, placeholder, type = "text" }: { la
 
 function CodeBlock({ title, content, language, onCopy, isCopied }: { title: string, content: string, language: string, onCopy: () => void, isCopied: boolean }) {
   return (
-    <div className="bg-[#111] border border-white/10 rounded-3xl overflow-hidden shadow-2xl group flex flex-col">
-      <div className="px-8 py-5 bg-[#151515] border-b border-white/10 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="flex gap-1.5 mr-2">
-            <div className="w-2.5 h-2.5 rounded-full bg-red-500/30 border border-red-500/50" />
-            <div className="w-2.5 h-2.5 rounded-full bg-amber-500/30 border border-amber-500/50" />
-            <div className="w-2.5 h-2.5 rounded-full bg-emerald-500/30 border border-emerald-500/50" />
+    <div className="bg-[#0f0f12] border border-white/10 rounded-[2rem] overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.5)] group flex flex-col">
+      <div className="px-10 py-6 bg-[#141417] border-b border-white/10 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <div className="flex gap-2 mr-3">
+            <div className="w-3 h-3 rounded-full bg-red-500/20 border border-red-500/40" />
+            <div className="w-3 h-3 rounded-full bg-amber-500/20 border border-amber-500/40" />
+            <div className="w-3 h-3 rounded-full bg-emerald-500/20 border border-emerald-500/40" />
           </div>
-          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest italic">{title}</span>
+          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest italic flex items-center gap-2">
+            <FileCode size={12} /> {title}
+          </span>
         </div>
         <button 
           onClick={onCopy}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black tracking-widest transition-all duration-300 \${
-            isCopied ? 'bg-emerald-500 text-black' : 'bg-white/5 text-slate-400 hover:text-white hover:bg-emerald-500/20'
+          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-[10px] font-black tracking-widest transition-all duration-300 ${
+            isCopied ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/30' : 'bg-white/5 text-slate-400 hover:text-white hover:bg-emerald-500/30'
           }`}
         >
           {isCopied ? <Check size={14} /> : <Copy size={14} />}
-          {isCopied ? 'COPIADO' : 'COPIAR CÓDIGO'}
+          {isCopied ? 'COPIADO' : 'COPIAR'}
         </button>
       </div>
-      <div className="p-8 overflow-hidden bg-black/20">
-        <pre className="text-xs font-mono text-emerald-400/90 leading-relaxed overflow-x-auto custom-scrollbar">
+      <div className="p-10 overflow-hidden bg-black/40">
+        <pre className="text-xs font-mono text-emerald-400/80 leading-relaxed overflow-x-auto custom-scrollbar">
           <code>{content}</code>
         </pre>
       </div>
     </div>
+  );
+}
+
+function FooterLink({ label }: { label: string }) {
+  return (
+    <a href="#" className="text-[10px] font-black uppercase text-slate-600 hover:text-emerald-400 transition-all tracking-[0.2em]">
+      {label}
+    </a>
   );
 }

@@ -1,6 +1,6 @@
 {
-  "name": "Custom Minecraft Dashboard Generator",
-  "description": "Gerador de painel web personalizado para controle de servidores Minecraft via Pterodactyl API, incluindo Backend Node.js, Frontend e scripts de configuração VPS.",
+  "name": "MinePanel Pro Generator",
+  "description": "Gerador completo de painel estilo EnxadaHost para Minecraft: Controle de energia, Gerenciador de Arquivos, Instalador de Modpacks e Backup via API Pterodactyl.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
