@@ -110,7 +110,7 @@ export default function App() {
     if (useCache && MEMORY_CACHE.has(cacheKey)) {
       const cached = MEMORY_CACHE.get(cacheKey)!;
       if (Date.now() - cached.timestamp < CACHE_TTL) {
-        return cached.data;
+        return { ok: true, status: 200, data: cached.data };
       }
     }
 
@@ -634,6 +634,10 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-[#E1E1E6] font-sans selection:bg-[#38e11d]/30">
+      {/* DEBUG MARKER */}
+      <div className="fixed top-0 left-0 bg-red-500 text-white text-[8px] z-[9999] px-1 pointer-events-none">
+        RENDER_OK
+      </div>
       {/* Grid Pattern Overlay */}
       <div className="fixed inset-0 bg-[radial-gradient(#1A1A1C_1px,transparent_1px)] [background-size:20px_20px] opacity-10 pointer-events-none" />
 
@@ -740,27 +744,27 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                   <MetricCard 
                     label="CPU" 
-                    value={`${stats?.cpu.usage ?? 0}%`} 
+                    value={`${stats?.cpu?.usage ?? 0}%`} 
                     icon={<Cpu className="text-[#00d1ff]" size={16} />}
-                    subLabel={`${stats?.cpu.cores ?? 0} Cores / ${stats?.cpu.temp ?? 0}°C`}
+                    subLabel={`${stats?.cpu?.cores ?? 0} Cores / ${stats?.cpu?.temp ?? 0}°C`}
                     color="#00d1ff"
-                    percentage={stats?.cpu.usage ?? 0}
+                    percentage={stats?.cpu?.usage ?? 0}
                   />
                   <MetricCard 
                     label="RAM" 
-                    value={`${stats?.ram.used ?? 0}/${stats?.ram.total ?? 0}GB`} 
+                    value={`${stats?.ram?.used ?? 0}/${stats?.ram?.total ?? 0}GB`} 
                     icon={<Database className="text-[#38e11d]" size={16} />}
-                    subLabel={`${stats?.ram.free ?? 0}GB Livres`}
+                    subLabel={`${stats?.ram?.free ?? 0}GB Livres`}
                     color="#38e11d"
-                    percentage={stats?.ram.percent ?? 0}
+                    percentage={stats?.ram?.percent ?? 0}
                   />
                   <MetricCard 
                     label="Rede (TX/RX)" 
-                    value={`${((stats?.network.tx || 0) / 1024 / 1024).toFixed(1)} / ${((stats?.network.rx || 0) / 1024 / 1024).toFixed(1)} MB/s`} 
+                    value={`${((stats?.network?.tx || 0) / 1024 / 1024).toFixed(1)} / ${((stats?.network?.rx || 0) / 1024 / 1024).toFixed(1)} MB/s`} 
                     icon={<Activity className="text-[#bd00ff]" size={16} />}
                     subLabel={`Tráfego em Tempo Real`}
                     color="#bd00ff"
-                    percentage={Math.min(((stats?.network.tx || 0) + (stats?.network.rx || 0)) / 10000000 * 100, 100)}
+                    percentage={Math.min(((stats?.network?.tx || 0) + (stats?.network?.rx || 0)) / 10000000 * 100, 100)}
                   />
                   <MetricCard 
                     label="Disk I/O" 

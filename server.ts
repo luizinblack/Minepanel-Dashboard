@@ -89,10 +89,10 @@ const getContext = (req: any) => {
   const serverId = (req.headers["x-server-id"] as string) || (req.query.serverId as string) || DEFAULT_SERVER_ID;
   const paths = getServerPaths(tenantId, serverId);
 
-  // Auto-create server directory structure if it doesn't exist
-  [paths.base, paths.uploads, paths.temp, paths.chunks, paths.logs].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  });
+  // Auto-create base server directory if it doesn't exist
+  if (!fs.existsSync(paths.base)) {
+    fs.mkdirSync(paths.base, { recursive: true });
+  }
 
   return { tenantId, serverId, paths };
 };
@@ -664,6 +664,9 @@ async function startServer() {
 
   const appendToLog = (data: string, tenantId: string = "tenant_001", serverId: string = DEFAULT_SERVER_ID) => {
     const paths = getServerPaths(tenantId, serverId);
+    if (!fs.existsSync(paths.logs)) {
+      fs.mkdirSync(paths.logs, { recursive: true });
+    }
     const logPath = path.join(paths.logs, "latest.log");
     fs.appendFileSync(logPath, data);
   };
@@ -1025,13 +1028,15 @@ async function startServer() {
     isProcessingQueue = false;
   };
 
-  // Initial structure check
+  // Initial structure check - removed force creation of default server to adhere to dynamic folder policy
+  /* 
   try {
     const defaultPaths = getServerPaths("tenant_001", DEFAULT_SERVER_ID);
     if (!fs.existsSync(defaultPaths.serverFiles)) {
       fs.mkdirSync(defaultPaths.serverFiles, { recursive: true });
     }
   } catch (e) {}
+  */
 
   // Standardized Upload System
   const getSubDirForMime = (mime: string) => {
