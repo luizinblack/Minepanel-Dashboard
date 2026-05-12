@@ -118,7 +118,10 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage });
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 * 1024 } 
+});
 
 async function startServer() {
   const app = express();
@@ -128,7 +131,8 @@ async function startServer() {
   
   // Security & Performance Middlewares
   app.use(compression());
-  app.use(express.json());
+  app.use(express.json({ limit: "10gb" }));
+  app.use(express.urlencoded({ extended: true, limit: "10gb" }));
   
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -156,6 +160,7 @@ async function startServer() {
   app.use("/api/", limiter);
 
   const httpServer = createServer(app);
+  httpServer.setTimeout(15 * 60 * 1000); // 15 minutes timeout for large uploads
   const io = new Server(httpServer, {
     cors: {
       origin: "*",
@@ -661,7 +666,7 @@ async function startServer() {
 
   const standardizedUpload = multer({
     storage: standardizedStorage,
-    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+    limits: { fileSize: 10 * 1024 * 1024 * 1024 }, // 10GB limit
     fileFilter: (req, file, cb) => {
       const allowed = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'application/pdf', 'application/zip', 'text/plain'];
       if (allowed.includes(file.mimetype) || file.originalname.endsWith('.jar')) {
@@ -765,7 +770,7 @@ async function startServer() {
 
   const chunkUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB per chunk
+    limits: { fileSize: 10 * 1024 * 1024 * 1024 } // 10GB limit (per chunk, though chunks are smaller)
   });
 
   app.post("/api/admin/upload/chunk", checkLimits, chunkUpload.single("chunk"), async (req: any, res) => {
