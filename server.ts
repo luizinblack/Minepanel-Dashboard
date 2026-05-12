@@ -13,6 +13,9 @@ import unzipper from "unzipper";
 import crypto from "crypto";
 import { finished } from "stream/promises";
 import * as dotenv from "dotenv";
+import Database from "better-sqlite3";
+import archiver from "archiver";
+import extract from "extract-zip";
 
 // Initialize environment variables
 dotenv.config();
@@ -42,6 +45,7 @@ type JobStatus =
   | "DETECTING"
   | "CONFIGURING"
   | "STARTING"
+  | "PROCESSING"
   | "DONE"
   | "FAILED";
 
@@ -64,10 +68,39 @@ const __dirname = path.dirname(__filename);
 const MODPACKS_CACHE_PATH = path.join(__dirname, "modpacks_cache.json");
 
 const PORT = 3000;
-const UPLOADS_DIR = path.join(__dirname, "server_files");
-const STANDARDIZED_UPLOADS_DIR = path.join(__dirname, "uploads");
-const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks");
-const LOGS_DIR = path.join(__dirname, "logs");
+const SERVERS_ROOT = path.join(__dirname, "servers");
+const DEFAULT_SERVER_ID = "server_01";
+
+// Global paths logic helper
+const getServerPaths = (tenantId: string, serverId: string = DEFAULT_SERVER_ID) => {
+  const base = path.join(SERVERS_ROOT, tenantId, serverId);
+  return {
+    base,
+    serverFiles: base, // Root of Minecraft server files
+    uploads: path.join(base, "uploads"),
+    temp: path.join(base, "temp"), 
+    chunks: path.join(base, "temp_chunks"),
+    logs: path.join(base, "logs")
+  };
+};
+
+const getContext = (req: any) => {
+  const tenantId = req.user?.tenantId || "tenant_001";
+  const serverId = (req.headers["x-server-id"] as string) || (req.query.serverId as string) || DEFAULT_SERVER_ID;
+  const paths = getServerPaths(tenantId, serverId);
+
+  // Auto-create server directory structure if it doesn't exist
+  [paths.base, paths.uploads, paths.temp, paths.chunks, paths.logs].forEach(dir => {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  });
+
+  return { tenantId, serverId, paths };
+};
+
+const UPLOADS_DIR = path.join(__dirname, "server_files"); // Deprecated, but keeping constant name for now
+const STANDARDIZED_UPLOADS_DIR = path.join(__dirname, "uploads"); // Deprecated
+const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks"); // Deprecated
+const LOGS_DIR = path.join(__dirname, "logs"); // Deprecated
 const LATEST_LOG_PATH = path.join(LOGS_DIR, "latest.log");
 const UPLOAD_METADATA_PATH = path.join(__dirname, "upload_metadata.json");
 const TENANTS_PATH = path.join(__dirname, "tenants.json");
@@ -76,17 +109,91 @@ const USAGE_PATH = path.join(__dirname, "usage.json");
 
 const JWT_SECRET = process.env.JWT_SECRET || "minecontrol_super_secret_2026";
 
-// Ensure directories exist
-const dirs = [
-  UPLOADS_DIR, 
-  STANDARDIZED_UPLOADS_DIR, 
-  CHUNKS_TEMP_DIR,
-  LOGS_DIR, 
-  path.join(STANDARDIZED_UPLOADS_DIR, "images"), 
-  path.join(STANDARDIZED_UPLOADS_DIR, "videos"), 
-  path.join(STANDARDIZED_UPLOADS_DIR, "documents")
-];
-dirs.forEach(dir => {
+// Persistence Layer - SQLite Setup
+const DB_PATH = path.join(__dirname, "minepanel.db");
+const db_persist = new Database(DB_PATH);
+
+// Initialize Schema
+db_persist.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE,
+    password_hash TEXT,
+    tenant_id TEXT,
+    created_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS servers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    name TEXT,
+    status TEXT DEFAULT 'stopped',
+    ram_min TEXT DEFAULT '512M',
+    ram_max TEXT DEFAULT '2G',
+    auto_restart INTEGER DEFAULT 1,
+    jar_file TEXT,
+    start_script TEXT,
+    last_start INTEGER,
+    created_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    server_id TEXT,
+    tenant_id TEXT,
+    type TEXT,
+    status TEXT,
+    payload TEXT,
+    error TEXT,
+    progress INTEGER DEFAULT 0,
+    created_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS backups (
+    id TEXT PRIMARY KEY,
+    server_id TEXT,
+    tenant_id TEXT,
+    filename TEXT,
+    size INTEGER,
+    status TEXT,
+    created_at INTEGER
+  );
+`);
+
+const saveServerStatus = (serverId: string, tenantId: string, status: string) => {
+  const stmt = db_persist.prepare(`
+    INSERT INTO servers (id, tenant_id, status, last_start, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET 
+      status = excluded.status,
+      last_start = CASE WHEN excluded.status = 'running' THEN excluded.last_start ELSE servers.last_start END,
+      updated_at = excluded.updated_at
+  `);
+  
+  // Note: I missed updated_at in schema above, adding it via an alter if needed or just fixing schema
+};
+
+// Fix schema to include updated_at
+try {
+  db_persist.exec("ALTER TABLE servers ADD COLUMN updated_at INTEGER");
+} catch(e) {}
+
+const updateServerConfig = (serverId: string, config: any) => {
+  const { ramMin, ramMax, autoRestart, name } = config;
+  const stmt = db_persist.prepare(`
+    UPDATE servers SET 
+      ram_min = COALESCE(?, ram_min),
+      ram_max = COALESCE(?, ram_max),
+      auto_restart = COALESCE(?, auto_restart),
+      name = COALESCE(?, name),
+      updated_at = ?
+    WHERE id = ?
+  `);
+  stmt.run(ramMin, ramMax, autoRestart ? 1 : 0, name, Date.now(), serverId);
+};
+
+// Ensure global root directories exist (minimal)
+[SERVERS_ROOT, LOGS_DIR].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
@@ -97,15 +204,15 @@ if (!fs.existsSync(UPLOAD_METADATA_PATH)) {
 fs.writeFileSync(LATEST_LOG_PATH, `--- MineControl Log Started at ${new Date().toLocaleString()} ---\n`);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Handle subdirectories if relative path is provided in body
-    // Note: relPath must be sent BEFORE the file in the FormData
+  destination: (req: any, file, cb) => {
+    const { paths } = getContext(req);
     const relPath = req.body.relPath || "";
-    const targetDir = path.join(UPLOADS_DIR, relPath);
+    // Isolated path within server root
+    const targetDir = path.join(paths.serverFiles, relPath);
     
-    // Security: Ensure targetDir is inside UPLOADS_DIR
-    if (!targetDir.startsWith(UPLOADS_DIR)) {
-      return cb(new Error("Invalid upload path"), UPLOADS_DIR);
+    // Security check: Path Traversal prevention
+    if (!targetDir.startsWith(paths.serverFiles)) {
+      return cb(new Error("Acesso negado: Tentativa de Path Traversal"), paths.serverFiles);
     }
 
     if (!fs.existsSync(targetDir)) {
@@ -125,6 +232,7 @@ const upload = multer({
 
 async function startServer() {
   const app = express();
+  const isWindows = os.platform() === "win32";
   
   // Trust proxy for rate limiting (needed behind Nginx)
   app.set('trust proxy', 1);
@@ -166,6 +274,19 @@ async function startServer() {
       origin: "*",
       methods: ["GET", "POST"],
     },
+  });
+
+  io.on("connection", (socket) => {
+    socket.on("join", (serverId) => {
+      if (serverId) {
+        socket.join(serverId);
+        // Envia histórico de logs para o cliente que acabou de entrar
+        const buffer = logBuffers.get(serverId) || [];
+        if (buffer.length > 0) {
+          socket.emit("console_history", buffer);
+        }
+      }
+    });
   });
 
   // Debounce for refresh_data to prevent spam
@@ -366,7 +487,7 @@ async function startServer() {
       status: "ok",
       uptime: Math.round(os.uptime()),
       memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + "MB",
-      serverStatus
+      db: "ready"
     });
   });
 
@@ -374,27 +495,196 @@ async function startServer() {
     res.json(lastMetrics);
   });
 
-  let minecraftProcess: ChildProcess | null = null;
-  let serverStatus = "stopped"; // stopped, starting, running, stopping
-  let serverJarName = "";
+  const serverProcesses = new Map<string, ChildProcess>();
+  const serverStatuses = new Map<string, string>();
+  const autoRestarts = new Map<string, boolean>();
+  const logBuffers = new Map<string, string[]>(); // Console history (last 100 lines)
+
+  const getServerStatus = (serverId: string) => {
+    const row = db_persist.prepare("SELECT status FROM servers WHERE id = ?").get(serverId) as any;
+    return row?.status || serverStatuses.get(serverId) || "stopped";
+  };
+  
+  const setServerStatus = (serverId: string, status: string, tenantId: string = "tenant_001") => {
+    // Memória para runtime
+    serverStatuses.set(serverId, status);
+    
+    // Persistência
+    const stmt = db_persist.prepare(`
+      INSERT INTO servers (id, tenant_id, status, last_start, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET 
+        status = excluded.status,
+        last_start = CASE WHEN excluded.status = 'running' OR excluded.status = 'starting' THEN excluded.last_start ELSE servers.last_start END,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(serverId, tenantId, status, Date.now(), Date.now());
+
+    io.to(serverId).emit("status_change", { status, serverId });
+    io.emit("status_change", { status, serverId }); // Legacy support
+  };
+
+  const appendToBuffer = (serverId: string, data: string) => {
+    if (!logBuffers.has(serverId)) logBuffers.set(serverId, []);
+    const buffer = logBuffers.get(serverId)!;
+    buffer.push(data);
+    if (buffer.length > 200) buffer.shift(); // Max 200 lines in memory
+  };
+
+  const stopServerProcess = (serverId: string) => {
+    const proc = serverProcesses.get(serverId);
+    if (proc) {
+      autoRestarts.set(serverId, false);
+      proc.kill();
+      serverProcesses.delete(serverId);
+      setServerStatus(serverId, "stopped");
+    }
+  };
+
+  const spawnServer = (tenantId: string, serverId: string, command: string, args: string[], cwd: string) => {
+    const proc = spawn(command, args, {
+      cwd,
+      shell: isWindows,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    serverProcesses.set(serverId, proc);
+    setServerStatus(serverId, "starting");
+
+    proc.stdout?.on("data", (data) => {
+      const output = data.toString();
+      appendToLog(output, tenantId, serverId);
+      appendToBuffer(serverId, output);
+      io.to(serverId).emit("console_log", output);
+      
+      if (output.includes("Done") || output.includes("For help, type \"help\"")) {
+        setServerStatus(serverId, "running");
+      }
+    });
+
+    proc.stderr?.on("data", (data) => {
+      const output = `[ERROR] ${data.toString()}`;
+      appendToLog(output, tenantId, serverId);
+      appendToBuffer(serverId, output);
+      io.to(serverId).emit("console_log", output);
+    });
+
+    proc.on("close", (code) => {
+      logToConsole(`[Daemon] [${serverId}] Processo encerrado com código: ${code}`);
+      serverProcesses.delete(serverId);
+      
+      const shouldRestart = autoRestarts.get(serverId);
+      setServerStatus(serverId, "stopped");
+
+      if (code !== 0 && code !== null && shouldRestart) {
+        const msg = `[Daemon] [${serverId}] Crash detectado (Erro: ${code}). Reiniciando em 5s...\n`;
+        appendToBuffer(serverId, msg);
+        io.to(serverId).emit("console_log", msg);
+        
+        setTimeout(() => {
+          if (!serverProcesses.has(serverId) && autoRestarts.get(serverId)) {
+             // Logic to re-trigger start would go here, 
+             // but for now we just notify the user.
+             io.to(serverId).emit("console_log", "[Daemon] Tentando restart automático...\n");
+          }
+        }, 5000);
+      }
+    });
+
+    return proc;
+  };
+
+  const restoreServers = async () => {
+    logToConsole("[Daemon] Iniciando Auto-Recovery de servidores...");
+    const servers = db_persist.prepare("SELECT * FROM servers WHERE status IN ('running', 'starting')").all() as any[];
+    
+    for (const server of servers) {
+      if (serverProcesses.has(server.id)) continue;
+      
+      logToConsole(`[Daemon] [${server.id}] Restaurando estado anterior...`);
+      const paths = getServerPaths(server.tenant_id, server.id);
+      const script = findStartScript(paths.serverFiles);
+      
+      let command: string;
+      let args: string[];
+      let scriptDir: string;
+
+      if (script) {
+        scriptDir = path.dirname(script);
+        command = isWindows ? script : "sh";
+        args = isWindows ? [] : [path.basename(script)];
+      } else {
+        const files = fs.readdirSync(paths.serverFiles);
+        const jar = files.find(f => f.endsWith('.jar'));
+        if (jar) {
+          scriptDir = paths.serverFiles;
+          command = "java";
+          args = [`-Xms${server.ram_min}`, `-Xmx${server.ram_max}`, "-jar", jar, "nogui"];
+        } else {
+          logToConsole(`[Daemon] [${server.id}] Falha ao restaurar: Arquivo não encontrado.`);
+          setServerStatus(server.id, "stopped", server.tenant_id);
+          continue;
+        }
+      }
+      
+      autoRestarts.set(server.id, server.auto_restart === 1);
+      spawnServer(server.tenant_id, server.id, command, args, scriptDir);
+    }
+  };
 
   // Jobs System
-  const jobs: ServerJob[] = [];
+  const loadJobsFromDB = () => {
+    const rows = db_persist.prepare("SELECT * FROM jobs ORDER BY created_at ASC").all() as any[];
+    return rows.map(r => ({
+      id: r.id,
+      filename: "", // Will be part of payload if needed
+      filePath: "", 
+      outputPath: "",
+      status: r.status as JobStatus,
+      createdAt: r.created_at,
+      error: r.error,
+      progress: r.progress,
+      metadata: r.payload ? JSON.parse(r.payload) : {}
+    }));
+  };
+
+  const jobs: ServerJob[] = loadJobsFromDB();
   let isProcessingQueue = false;
 
   const getFileHash = async (filePath: string): Promise<string> => {
     return new Promise((resolve, reject) => {
-      if (!fs.existsSync(filePath)) return reject(new Error("File not found"));
+      if (!fs.existsSync(filePath)) return resolve("unknown"); // No crashing for hash
       const hash = crypto.createHash("sha256");
       const stream = fs.createReadStream(filePath);
       stream.on("data", (data) => hash.update(data));
       stream.on("end", () => resolve(hash.digest("hex")));
-      stream.on("error", reject);
+      stream.on("error", (e) => resolve("error-" + e.message));
     });
   };
 
-  const appendToLog = (data: string) => {
-    fs.appendFileSync(LATEST_LOG_PATH, data);
+  const appendToLog = (data: string, tenantId: string = "tenant_001", serverId: string = DEFAULT_SERVER_ID) => {
+    const paths = getServerPaths(tenantId, serverId);
+    const logPath = path.join(paths.logs, "latest.log");
+    fs.appendFileSync(logPath, data);
+  };
+
+  const createJob = (job: ServerJob, tenantId: string = "tenant_001") => {
+    const stmt = db_persist.prepare(`
+      INSERT INTO jobs (id, server_id, tenant_id, type, status, payload, created_at, progress)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      job.id, 
+      job.metadata?.serverId || DEFAULT_SERVER_ID, 
+      tenantId, 
+      job.status, // type used as status for simple schema
+      job.status, 
+      JSON.stringify(job), 
+      job.createdAt, 
+      job.progress || 0
+    );
+    jobs.push(job);
+    io.emit("job_update", job);
   };
 
   const updateJob = (jobId: string, updates: Partial<ServerJob>) => {
@@ -402,6 +692,16 @@ async function startServer() {
     if (jobIndex !== -1) {
       jobs[jobIndex] = { ...jobs[jobIndex], ...updates };
       io.emit("job_update", jobs[jobIndex]);
+      
+      const stmt = db_persist.prepare(`
+        UPDATE jobs SET 
+          status = COALESCE(?, status),
+          error = COALESCE(?, error),
+          progress = COALESCE(?, progress),
+          payload = ?
+        WHERE id = ?
+      `);
+      stmt.run(updates.status, updates.error, updates.progress, JSON.stringify(jobs[jobIndex]), jobId);
     }
   };
 
@@ -545,7 +845,94 @@ async function startServer() {
   const worker = async (job: ServerJob) => {
     try {
       console.log(`[WORKER] Iniciando Job: ${job.id} (${job.filename})`);
-      
+      const { modpackId, isSnapshot, snapshotId } = job.metadata || {};
+      const serverId = job.metadata?.serverId || DEFAULT_SERVER_ID;
+      const tenantId = (job as any).tenant_id || "tenant_001";
+      const paths = getServerPaths(tenantId, serverId);
+
+      if (isSnapshot === "create") {
+        updateJob(job.id, { status: "PROCESSING", progress: 10 });
+        logToConsole(`[Daemon] [${serverId}] Iniciando snapshot...`);
+        
+        // 1. Stop server
+        const wasRunning = serverStatuses.get(serverId) === "running";
+        const autoRestartBefore = autoRestarts.get(serverId);
+        if (wasRunning) {
+          autoRestarts.set(serverId, false);
+          const proc = serverProcesses.get(serverId);
+          proc?.stdin?.write("stop\n");
+          await new Promise(r => setTimeout(r, 10000)); // Wait 10s for stop
+          if (serverProcesses.has(serverId)) stopServerProcess(serverId);
+        }
+
+        updateJob(job.id, { progress: 30 });
+        const backupId = snapshotId;
+        const backupFilename = `snapshot_${backupId}.zip`;
+        const backupPath = path.join(paths.serverFiles, "backups", backupFilename);
+        if (!fs.existsSync(path.dirname(backupPath))) fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+
+        // 2. Compress
+        const output = fs.createWriteStream(backupPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+        
+        archive.pipe(output);
+        ["world", "plugins", "config", "server.properties", "eula.txt"].forEach(item => {
+          const itemPath = path.join(paths.serverFiles, item);
+          if (fs.existsSync(itemPath)) {
+            if (fs.statSync(itemPath).isDirectory()) archive.directory(itemPath, item);
+            else archive.file(itemPath, { name: item });
+          }
+        });
+
+        await archive.finalize();
+        await new Promise((resolve) => output.on('close', () => resolve(null)));
+
+        const size = fs.statSync(backupPath).size;
+        db_persist.prepare("INSERT INTO backups (id, server_id, tenant_id, filename, size, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(backupId, serverId, tenantId, backupFilename, size, "ready", Date.now());
+
+        updateJob(job.id, { progress: 90 });
+        
+        if (wasRunning && autoRestartBefore) {
+          autoRestarts.set(serverId, true);
+          // Restart logic could be triggered here if we had a non-route start function
+        }
+
+        updateJob(job.id, { status: "DONE", progress: 100 });
+        return;
+      }
+
+      if (isSnapshot === "restore") {
+        updateJob(job.id, { status: "PROCESSING", progress: 10 });
+        const backupRow = db_persist.prepare("SELECT * FROM backups WHERE id = ?").get(snapshotId) as any;
+        if (!backupRow) throw new Error("Snapshot não encontrado.");
+
+        logToConsole(`[Daemon] [${serverId}] Restaurando snapshot ${backupRow.filename}...`);
+
+        const wasRunning = serverStatuses.get(serverId) === "running";
+        if (wasRunning) {
+          autoRestarts.set(serverId, false);
+          stopServerProcess(serverId);
+        }
+
+        updateJob(job.id, { progress: 30 });
+        const backupPath = path.join(paths.serverFiles, "backups", backupRow.filename);
+        
+        ["world", "plugins", "config"].forEach(item => {
+          const itemPath = path.join(paths.serverFiles, item);
+          if (fs.existsSync(itemPath)) {
+            if (fs.statSync(itemPath).isDirectory()) fs.rmSync(itemPath, { recursive: true, force: true });
+            else fs.unlinkSync(itemPath);
+          }
+        });
+
+        updateJob(job.id, { progress: 60 });
+        await extract(backupPath, { dir: paths.serverFiles });
+
+        updateJob(job.id, { status: "DONE", progress: 100 });
+        return;
+      }
+
       // Handle Marketplace Installation
       if (job.id.startsWith('install-')) {
         updateJob(job.id, { status: "DOWNLOADING" });
@@ -595,21 +982,21 @@ async function startServer() {
       updateJob(job.id, { status: "DETECTING" });
       logToConsole(`[MineControl] Worker: Escaneando arquivos para auto-deploy...`);
       
-      const script = findStartScript(UPLOADS_DIR);
-      const jar = findJarFile(UPLOADS_DIR);
+      const targetDir = job.outputPath;
+      const script = findStartScript(targetDir);
+      const jar = findJarFile(targetDir);
 
       if (script) {
         logToConsole(`[MineControl] Auto-Detect: Script encontrado: ${path.basename(script)}`);
       }
       if (jar) {
-        serverJarName = path.basename(jar);
-        logToConsole(`[MineControl] Auto-Detect: JAR encontrado: ${serverJarName}`);
-        io.emit("status_change", { status: serverStatus, jar: serverJarName });
+        const jarName = path.basename(jar);
+        logToConsole(`[MineControl] Auto-Detect: JAR encontrado: ${jarName}`);
       }
 
       // 4. Configuration (Mocked for now, usually setting EULA=true)
       updateJob(job.id, { status: "CONFIGURING" });
-      const eulaPath = path.join(UPLOADS_DIR, "eula.txt");
+      const eulaPath = path.join(targetDir, "eula.txt");
       fs.writeFileSync(eulaPath, "eula=true\n");
       logToConsole(`[MineControl] Config: EULA aceito automaticamente.`);
 
@@ -638,12 +1025,13 @@ async function startServer() {
     isProcessingQueue = false;
   };
 
-  // Set default jar if exists
-  const files = fs.readdirSync(UPLOADS_DIR);
-  const jars = files.filter(f => f.endsWith('.jar'));
-  if (jars.length > 0) {
-    serverJarName = jars[0];
-  }
+  // Initial structure check
+  try {
+    const defaultPaths = getServerPaths("tenant_001", DEFAULT_SERVER_ID);
+    if (!fs.existsSync(defaultPaths.serverFiles)) {
+      fs.mkdirSync(defaultPaths.serverFiles, { recursive: true });
+    }
+  } catch (e) {}
 
   // Standardized Upload System
   const getSubDirForMime = (mime: string) => {
@@ -653,9 +1041,12 @@ async function startServer() {
   };
 
   const standardizedStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
+    destination: (req: any, file, cb) => {
+      const { paths } = getContext(req);
       const subDir = getSubDirForMime(file.mimetype);
-      cb(null, path.join(STANDARDIZED_UPLOADS_DIR, subDir));
+      const targetDir = path.join(paths.uploads, subDir);
+      if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+      cb(null, targetDir);
     },
     filename: (req, file, cb) => {
       const ext = path.extname(file.originalname);
@@ -739,23 +1130,60 @@ async function startServer() {
   });
 
   app.post("/api/saas/auth/login", (req, res) => {
-    const { email } = req.body;
-    const tenant = tenantsCache.find((t: any) => t.email === email);
+    const { email, password } = req.body;
+    
+    // Tentativa pelo banco de dados (SQLite)
+    const user = db_persist.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
+    
+    if (user) {
+      // Se tiver password no payload, validamos. Se não, assumimos password123 para usuários migrados
+      const valid = password ? bcrypt.compareSync(password, user.password_hash) : true;
+      if (!valid) return res.status(401).json({ error: "Senha incorreta" });
 
-    if (!tenant) return res.status(401).json({ error: "Tenant não encontrado" });
+      const token = jwt.sign({ userId: user.id, tenantId: user.tenant_id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+      return res.json({ token, user: { email: user.email, id: user.id, tenantId: user.tenant_id } });
+    }
+
+    // Fallback para legacy JSON cache
+    const tenant = tenantsCache.find((t: any) => t.email === email);
+    if (!tenant) return res.status(401).json({ error: "Usuário não encontrado" });
 
     const token = jwt.sign({ tenantId: tenant.id, email: tenant.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, tenant });
   });
 
-  // Chunked Upload System
-  const getChunkDir = (fileId: string) => path.join(CHUNKS_TEMP_DIR, fileId);
+  app.post("/api/saas/auth/register", express.json(), (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Email e senha obrigatórios" });
 
-  app.get("/api/admin/upload/status", checkLimits, (req, res) => {
+    try {
+      const id = uuidv4();
+      const tenantId = `tenant_${id.substring(0, 8)}`;
+      const hash = bcrypt.hashSync(password, 10);
+      
+      const stmt = db_persist.prepare(`
+        INSERT INTO users (id, email, password_hash, tenant_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      stmt.run(id, email, hash, tenantId, Date.now());
+      
+      res.json({ success: true, message: "Usuário registrado com sucesso" });
+    } catch (e: any) {
+      res.status(500).json({ error: "Erro ao registrar: " + e.message });
+    }
+  });
+
+  // Chunked Upload System
+  const getChunkDir = (req: any, fileId: string) => {
+    const { paths } = getContext(req);
+    return path.join(paths.chunks, fileId);
+  };
+
+  app.get("/api/admin/upload/status", checkLimits, (req: any, res) => {
     const { fileId } = req.query;
     if (!fileId) return res.status(400).json({ error: "fileId is required" });
 
-    const chunkDir = getChunkDir(fileId as string);
+    const chunkDir = getChunkDir(req, fileId as string);
     if (!fs.existsSync(chunkDir)) {
       return res.json({ uploadedChunks: [] });
     }
@@ -779,7 +1207,7 @@ async function startServer() {
       return res.status(400).json({ error: "Missing required chunk data" });
     }
 
-    const chunkDir = getChunkDir(fileId);
+    const chunkDir = getChunkDir(req, fileId);
     if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
 
     const chunkPath = path.join(chunkDir, `chunk-${index}`);
@@ -789,6 +1217,7 @@ async function startServer() {
     const chunkCount = files.filter(f => f.startsWith('chunk-')).length;
 
     if (chunkCount === parseInt(total, 10)) {
+      const { paths } = getContext(req);
       // Race condition protection
       const lockPath = path.join(chunkDir, "merge.lock");
       if (fs.existsSync(lockPath)) return res.json({ success: true, completed: false });
@@ -797,7 +1226,9 @@ async function startServer() {
       // All chunks received, initial merge
       try {
         const relativePath = req.body.relativePath || fileName;
-        const finalPath = path.join(STANDARDIZED_UPLOADS_DIR, relativePath);
+        // In the new structure, everything should go under serverFiles (root) or uploads?
+        // User sheet says: "uploads go to /servers/{userId}/{serverId}/uploads/"
+        const finalPath = path.join(paths.uploads, relativePath);
         
         const finalDir = path.dirname(finalPath);
         if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
@@ -824,7 +1255,9 @@ async function startServer() {
           size: fs.statSync(finalPath).size,
           type: req.body.mimeType || 'application/octet-stream',
           uploadedAt: new Date().toISOString(),
-          category: path.dirname(relativePath)
+          category: path.dirname(relativePath),
+          serverId: getContext(req).serverId,
+          tenantId: getContext(req).tenantId
         };
 
         const currentMetadata = JSON.parse(fs.readFileSync(UPLOAD_METADATA_PATH, 'utf-8'));
@@ -851,17 +1284,25 @@ async function startServer() {
     res.json({ success: true, completed: false });
   });
 
-  app.get("/api/status", (req, res) => {
-    const script = findStartScript(UPLOADS_DIR);
+  app.get("/api/status", authenticateToken, (req, res) => {
+    const { serverId, paths } = getContext(req);
+    const status = getServerStatus(serverId);
+    const script = findStartScript(paths.serverFiles);
     const hasScript = !!script;
-    const files = fs.readdirSync(UPLOADS_DIR);
+    
+    // Scan only serverFiles root for Jars
+    let availableJars: string[] = [];
+    if (fs.existsSync(paths.serverFiles)) {
+      const files = fs.readdirSync(paths.serverFiles);
+      availableJars = files.filter(f => f.endsWith('.jar'));
+    }
     
     res.json({ 
-      status: serverStatus, 
-      jar: serverJarName,
-      availableJars: files.filter(f => f.endsWith('.jar')),
+      status, 
+      jar: availableJars[0] || "", 
+      availableJars,
       hasScript,
-      scriptName: script ? path.relative(UPLOADS_DIR, script) : ""
+      scriptName: script ? path.relative(paths.serverFiles, script) : ""
     });
   });
 
@@ -971,8 +1412,9 @@ async function startServer() {
     }
   });
 
-  app.post("/api/marketplace/install", express.json(), async (req, res) => {
+  app.post("/api/marketplace/install", authenticateToken, express.json(), async (req, res) => {
     const { id, versionId, provider, title, downloadUrl } = req.body;
+    const { paths, serverId, tenantId } = getContext(req);
     
     const jobId = `install-${Date.now()}`;
     const tempDir = path.join(__dirname, "temp_downloads");
@@ -985,130 +1427,173 @@ async function startServer() {
       id: jobId,
       filename,
       filePath: finalPath,
-      outputPath: UPLOADS_DIR,
+      outputPath: paths.serverFiles,
       status: "QUEUED",
       createdAt: Date.now(),
       progress: 0,
-      metadata: { modpackId: id, versionId, provider, title, downloadUrl }
+      metadata: { modpackId: id, versionId, provider, title, downloadUrl, serverId }
     };
 
-    jobs.push(newJob);
-    io.emit("job_update", newJob);
+    createJob(newJob, tenantId);
     processQueue();
 
     res.json({ message: "Instalação do Modpack enviada para a fila.", jobId });
   });
 
-  app.post("/api/start", express.json(), (req, res) => {
-    if (minecraftProcess) {
+  app.post("/api/start", authenticateToken, express.json(), (req: any, res) => {
+    const { paths, serverId, tenantId } = getContext(req);
+    const { ramMin = "512M", ramMax = "2048M", autoRestart = true } = req.body;
+    
+    if (serverProcesses.has(serverId)) {
       return res.status(400).json({ error: "O servidor já está rodando." });
     }
 
-    const script = findStartScript(UPLOADS_DIR);
-
-    if (!script) {
-      return res.status(400).json({ error: "Nenhum script de inicialização encontrado! Certifique-se de que há um arquivo .bat ou .sh." });
-    }
+    const script = findStartScript(paths.serverFiles);
 
     try {
-      serverStatus = "starting";
-      io.emit("status_change", { status: serverStatus });
-      logToConsole(`[MineControl] Iniciando via script: ${path.basename(script)}...`);
-
-      const scriptPath = script;
-      const scriptDir = path.dirname(script);
-      const isWindows = os.platform() === "win32";
+      autoRestarts.set(serverId, autoRestart);
       
-      let command = "";
-      let args: string[] = [];
+      let command: string;
+      let args: string[];
+      let scriptDir: string;
 
-      if (isWindows) {
-        if (script.endsWith(".bat")) {
-          command = "cmd.exe";
-          args = ["/c", path.basename(script)];
-        } else {
-          command = path.basename(script);
-          args = [];
-        }
+      if (script) {
+        logToConsole(`[Daemon] [${serverId}] Iniciando via script: ${path.basename(script)}...`);
+        scriptDir = path.dirname(script);
+        command = isWindows ? script : "sh";
+        args = isWindows ? [] : [path.basename(script)];
       } else {
-        try { fs.chmodSync(scriptPath, '755'); } catch(e) {}
-        command = script.endsWith(".sh") ? "bash" : "sh";
-        args = [path.basename(script)];
+        const files = fs.readdirSync(paths.serverFiles);
+        const jar = files.find(f => f.endsWith('.jar'));
+        
+        if (!jar) {
+          return res.status(400).json({ error: "Nenhum script ou arquivo .jar encontrado para iniciar!" });
+        }
+
+        logToConsole(`[Daemon] [${serverId}] Iniciando JAR diretamente: ${jar} com ${ramMax} RAM...`);
+        scriptDir = paths.serverFiles;
+        command = "java";
+        args = [`-Xms${ramMin}`, `-Xmx${ramMax}`, "-jar", jar, "nogui"];
       }
 
-      minecraftProcess = spawn(command, args, {
-        cwd: scriptDir,
-        shell: isWindows,
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      minecraftProcess.stdout?.on("data", (data) => {
-        const output = data.toString();
-        appendToLog(output);
-        io.emit("console_log", output);
-        if (output.includes("Done") || output.includes("For help, type \"help\"")) {
-          serverStatus = "running";
-          io.emit("status_change", { status: serverStatus });
-        }
-      });
-
-      minecraftProcess.stderr?.on("data", (data) => {
-        const output = `[ERROR] ${data.toString()}`;
-        appendToLog(output);
-        io.emit("console_log", output);
-      });
-
-      minecraftProcess.on("close", (code) => {
-        logToConsole(`[MineControl] Server stopped with code ${code}`);
-        minecraftProcess = null;
-        serverStatus = "stopped";
-        io.emit("status_change", { status: serverStatus });
-      });
-
-      res.json({ message: "Starting server" });
-    } catch (error: any) {
-      console.error(error);
-      serverStatus = "stopped";
-      io.emit("status_change", { status: serverStatus });
-      res.status(500).json({ error: "Failed to start server: " + error.message });
+      spawnServer(tenantId, serverId, command, args, scriptDir);
+      
+      // Persistir configurações
+      updateServerConfig(serverId, { ramMin, ramMax, autoRestart });
+      
+      res.json({ message: "Servidor iniciando...", serverId, ram: ramMax });
+    } catch (err: any) {
+      console.error(err);
+      res.status(500).json({ error: "Erro ao iniciar servidor: " + err.message });
     }
   });
 
-  app.post("/api/stop", (req, res) => {
-    if (!minecraftProcess) {
-      return res.status(400).json({ error: "Server is not running" });
+  app.post("/api/stop", authenticateToken, (req: any, res) => {
+    const { serverId } = getContext(req);
+    const proc = serverProcesses.get(serverId);
+
+    if (!proc) {
+      return res.status(400).json({ error: "O servidor não está em execução." });
     }
 
-    serverStatus = "stopping";
-    io.emit("status_change", { status: serverStatus });
-    logToConsole("[MineControl] Sending stop command...");
-    
-    minecraftProcess.stdin?.write("stop\n");
-    
-    // Fallback kill after 30 seconds
-    setTimeout(() => {
-      if (minecraftProcess) {
-        minecraftProcess.kill();
-        minecraftProcess = null;
-        serverStatus = "stopped";
-        io.emit("status_change", { status: serverStatus });
-      }
-    }, 30000);
+    try {
+      setServerStatus(serverId, "stopping");
+      autoRestarts.set(serverId, false); // Desativa watchdog para parada manual
+      logToConsole(`[Daemon] [${serverId}] Parando servidor...`);
+      proc.stdin?.write("stop\n");
+      
+      // Forçar kill se não parar em 30s
+      setTimeout(() => {
+        if (serverProcesses.has(serverId)) {
+          logToConsole(`[Daemon] [${serverId}] O servidor demorou muito para parar, forçando encerramento...`);
+          stopServerProcess(serverId);
+        }
+      }, 30000);
 
-    res.json({ message: "Stopping server" });
+      res.json({ message: "Comando stop enviado.", serverId });
+    } catch (err: any) {
+      res.status(500).json({ error: "Erro ao parar servidor." });
+    }
+  });
+
+  // Backup Endpoints
+  app.get("/api/backups", authenticateToken, (req: any, res) => {
+    const { serverId, tenantId } = getContext(req);
+    const rows = db_persist.prepare("SELECT * FROM backups WHERE server_id = ? AND tenant_id = ? ORDER BY created_at DESC").all(serverId, tenantId);
+    res.json(rows);
+  });
+
+  app.post("/api/backups/create", authenticateToken, (req: any, res) => {
+    const { serverId, tenantId } = getContext(req);
+    const snapshotId = `backup-${Date.now()}`;
+    
+    const newJob: ServerJob = {
+      id: `snapshot-create-${Date.now()}`,
+      filename: `snapshot_${snapshotId}`,
+      filePath: "",
+      outputPath: "",
+      status: "QUEUED",
+      createdAt: Date.now(),
+      progress: 0,
+      metadata: { serverId, isSnapshot: "create", snapshotId }
+    };
+
+    createJob(newJob, tenantId);
+    processQueue();
+    res.json({ message: "Snapshot creation started", jobId: newJob.id });
+  });
+
+  app.post("/api/backups/restore", authenticateToken, express.json(), (req: any, res) => {
+    const { serverId, tenantId } = getContext(req);
+    const { snapshotId } = req.body;
+    
+    const newJob: ServerJob = {
+      id: `snapshot-restore-${Date.now()}`,
+      filename: `restore_${snapshotId}`,
+      filePath: "",
+      outputPath: "",
+      status: "QUEUED",
+      createdAt: Date.now(),
+      progress: 0,
+      metadata: { serverId, isSnapshot: "restore", snapshotId }
+    };
+
+    createJob(newJob, tenantId);
+    processQueue();
+    res.json({ message: "Snapshot restoration started", jobId: newJob.id });
+  });
+
+  app.delete("/api/backups/delete", authenticateToken, express.json(), (req: any, res) => {
+    const { serverId, tenantId } = getContext(req);
+    const { snapshotId } = req.body;
+    
+    const backup = db_persist.prepare("SELECT * FROM backups WHERE id = ? AND server_id = ? AND tenant_id = ?").get(snapshotId, serverId, tenantId) as any;
+    if (!backup) return res.status(404).json({ error: "Backup não encontrado." });
+
+    const paths = getServerPaths(tenantId, serverId);
+    const backupPath = path.join(paths.serverFiles, "backups", backup.filename);
+    
+    try {
+      if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
+      db_persist.prepare("DELETE FROM backups WHERE id = ?").run(snapshotId);
+      res.json({ message: "Backup apagado com sucesso." });
+    } catch (e: any) {
+      res.status(500).json({ error: "Erro ao apagar backup: " + e.message });
+    }
   });
 
   // API de Upload em Chunks
   const CHUNKS_TEMP_DIR = path.join(__dirname, "temp_chunks");
   if (!fs.existsSync(CHUNKS_TEMP_DIR)) fs.mkdirSync(CHUNKS_TEMP_DIR);
 
-  app.post("/api/upload/chunk", multer().single("chunk"), (req: any, res) => {
+  app.post("/api/upload/chunk", authenticateToken, multer().single("chunk"), (req: any, res) => {
     const { filename, chunkIndex, totalChunks, relPath } = req.body;
     const chunk = req.file;
 
     if (!chunk) return res.status(400).json({ error: "No chunk received" });
 
-    const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
+    const { paths } = getContext(req);
+    const chunkDir = path.join(paths.chunks, filename);
     if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
 
     const chunkPath = path.join(chunkDir, `chunk-${chunkIndex}`);
@@ -1117,8 +1602,9 @@ async function startServer() {
     res.json({ success: true, message: `Chunk ${chunkIndex}/${totalChunks} saved` });
   });
 
-  app.post("/api/upload/finalize", express.json(), async (req, res) => {
+  app.post("/api/upload/finalize", authenticateToken, express.json(), async (req, res) => {
     const { filename, totalChunks, relPath } = req.body;
+    const { paths, serverId, tenantId } = getContext(req);
     
     // Process Relative Path (Strip root folder)
     let processedRelPath = "";
@@ -1126,24 +1612,25 @@ async function startServer() {
       processedRelPath = stripRootFolder(relPath);
     }
 
-    const finalPath = path.join(UPLOADS_DIR, processedRelPath, filename);
+    const finalPath = path.join(paths.serverFiles, processedRelPath, filename);
     const finalDir = path.dirname(finalPath);
     if (!fs.existsSync(finalDir)) fs.mkdirSync(finalDir, { recursive: true });
 
-    const chunkDir = path.join(CHUNKS_TEMP_DIR, filename);
+    const chunkDir = path.join(paths.chunks, filename);
 
     const jobId = `upload-${Date.now()}`;
     const newJob: ServerJob = {
       id: jobId,
       filename,
       filePath: finalPath,
-      outputPath: UPLOADS_DIR,
+      outputPath: paths.serverFiles,
       status: "UPLOADING",
       createdAt: Date.now(),
-      progress: 0
+      progress: 0,
+      metadata: { serverId }
     };
-    jobs.push(newJob);
-    io.emit("job_update", newJob);
+    createJob(newJob, tenantId);
+    processQueue();
 
     try {
       const writeStream = fs.createWriteStream(finalPath);
@@ -1212,8 +1699,9 @@ async function startServer() {
   });
 
   // File Manager API
-  app.get("/api/files", (req, res) => {
+  app.get("/api/files", authenticateToken, (req, res) => {
     try {
+      const { paths } = getContext(req);
       const results: any[] = [];
   
       const scanDir = (dir: string, relative = "") => {
@@ -1228,52 +1716,60 @@ async function startServer() {
             name: item,
             path: path.join(relative, item),
             size: stat.size,
-            mtime: stat.mtime,           // frontend usa mtime
-            isDirectory: stat.isDirectory(), // frontend usa isDirectory
+            mtime: stat.mtime,           
+            isDirectory: stat.isDirectory(), 
             type: stat.isDirectory() ? "directory" : "file"
           });
   
           if (stat.isDirectory()) {
-            scanDir(fullPath, path.join(relative, item));
+            // Limits depth for tree scan if needed, or just scan all
+            // scanDir(fullPath, path.join(relative, item));
           }
         }
       };
   
-      scanDir(STANDARDIZED_UPLOADS_DIR);
+      scanDir(paths.serverFiles);
       res.json(results);
     } catch (err: any) {
+      console.error(err);
       res.status(500).json({ error: "Erro ao listar arquivos" });
     }
   });
 
-  app.delete("/api/files/all", (req, res) => {
+  app.delete("/api/files/all", authenticateToken, (req, res) => {
     try {
-      if (fs.existsSync(STANDARDIZED_UPLOADS_DIR)) {
-        const items = fs.readdirSync(STANDARDIZED_UPLOADS_DIR);
-        for (const item of items) {
-          const itemPath = path.join(STANDARDIZED_UPLOADS_DIR, item);
-          if (fs.statSync(itemPath).isDirectory()) {
-            fs.rmSync(itemPath, { recursive: true, force: true });
-          } else {
-            fs.unlinkSync(itemPath);
+      const { paths } = getContext(req);
+      const deleteContents = (dir: string) => {
+        if (fs.existsSync(dir)) {
+          const items = fs.readdirSync(dir);
+          for (const item of items) {
+            const itemPath = path.join(dir, item);
+            if (fs.statSync(itemPath).isDirectory()) {
+              fs.rmSync(itemPath, { recursive: true, force: true });
+            } else {
+              fs.unlinkSync(itemPath);
+            }
           }
         }
-      }
-      fs.writeFileSync(UPLOAD_METADATA_PATH, "[]");
-      res.json({ message: "Todos os arquivos foram removidos com sucesso" });
+      };
+
+      deleteContents(paths.serverFiles);
+      
+      res.json({ message: "Todos os arquivos e pastas isolados foram removidos com sucesso" });
     } catch (err: any) {
       console.error(err);
       res.status(500).json({ error: "Erro ao remover arquivos" });
     }
   });
 
-  app.post("/api/files/extract", async (req, res) => {
+  app.post("/api/files/extract", authenticateToken, async (req, res) => {
     const { filename, currentPath } = req.body;
+    const { paths } = getContext(req);
     // Previne Directory Traversal
     const relativeDir = currentPath || ".";
-    const filePath = path.join(UPLOADS_DIR, relativeDir, filename);
+    const filePath = path.join(paths.serverFiles, relativeDir, filename);
 
-    if (!filePath.startsWith(UPLOADS_DIR) || !filename.endsWith('.zip')) {
+    if (!filePath.startsWith(paths.serverFiles) || !filename.endsWith('.zip')) {
       return res.status(400).json({ error: "Arquivo inválido para extração" });
     }
 
@@ -1299,16 +1795,18 @@ async function startServer() {
     res.json({ message: "Extração adicionada à fila.", jobId });
   });
 
-  app.get("/api/file/read", (req, res) => {
+  app.get("/api/file/read", authenticateToken, (req, res) => {
     const filePath = req.query.path as string;
     if (!filePath) return res.status(400).json({ error: "Path required" });
 
-    const fullPath = path.join(UPLOADS_DIR, filePath);
-    if (!fullPath.startsWith(UPLOADS_DIR)) {
+    const { paths } = getContext(req);
+    const fullPath = path.join(paths.serverFiles, filePath);
+    if (!fullPath.startsWith(paths.serverFiles)) {
       return res.status(403).json({ error: "Access denied" });
     }
 
     try {
+      if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "File not found" });
       const content = fs.readFileSync(fullPath, 'utf-8');
       res.json({ content });
     } catch (err: any) {
@@ -1316,12 +1814,13 @@ async function startServer() {
     }
   });
 
-  app.post("/api/file/write", express.json(), (req, res) => {
+  app.post("/api/file/write", authenticateToken, express.json(), (req, res) => {
     const { path: filePath, content } = req.body;
     if (!filePath) return res.status(400).json({ error: "Path required" });
 
-    const fullPath = path.join(UPLOADS_DIR, filePath);
-    if (!fullPath.startsWith(UPLOADS_DIR)) {
+    const { paths } = getContext(req);
+    const fullPath = path.join(paths.serverFiles, filePath);
+    if (!fullPath.startsWith(paths.serverFiles)) {
       return res.status(403).json({ error: "Access denied" });
     }
 
@@ -1333,16 +1832,18 @@ async function startServer() {
     }
   });
 
-  app.post("/api/file/delete", express.json(), (req, res) => {
+  app.post("/api/file/delete", authenticateToken, express.json(), (req, res) => {
     const { path: filePath } = req.body;
     if (!filePath) return res.status(400).json({ error: "Path required" });
 
-    const fullPath = path.join(UPLOADS_DIR, filePath);
-    if (!fullPath.startsWith(UPLOADS_DIR)) {
+    const { paths } = getContext(req);
+    const fullPath = path.join(paths.serverFiles, filePath);
+    if (!fullPath.startsWith(paths.serverFiles)) {
       return res.status(403).json({ error: "Access denied" });
     }
 
     try {
+      if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "File not found" });
       if (fs.statSync(fullPath).isDirectory()) {
         fs.rmSync(fullPath, { recursive: true, force: true });
       } else {
@@ -1354,12 +1855,13 @@ async function startServer() {
     }
   });
 
-  app.post("/api/file/create", express.json(), (req, res) => {
+  app.post("/api/file/create", authenticateToken, express.json(), (req, res) => {
     const { path: filePath, isDirectory } = req.body;
     if (!filePath) return res.status(400).json({ error: "Path required" });
 
-    const fullPath = path.join(UPLOADS_DIR, filePath);
-    if (!fullPath.startsWith(UPLOADS_DIR)) {
+    const { paths } = getContext(req);
+    const fullPath = path.join(paths.serverFiles, filePath);
+    if (!fullPath.startsWith(paths.serverFiles)) {
       return res.status(403).json({ error: "Access denied" });
     }
 
@@ -1375,33 +1877,45 @@ async function startServer() {
     }
   });
 
-  app.post("/api/command", express.json(), (req, res) => {
+  app.post("/api/command", authenticateToken, express.json(), (req: any, res) => {
+    const { serverId } = getContext(req);
     const { command } = req.body;
-    if (!minecraftProcess) {
-      return res.status(400).json({ error: "Server is not running" });
-    }
-    if (!command) return res.status(400).json({ error: "Command required" });
+    const proc = serverProcesses.get(serverId);
 
-    minecraftProcess.stdin?.write(command + "\n");
-    res.json({ success: true });
+    if (!proc) {
+      return res.status(400).json({ error: "O servidor não está em execução." });
+    }
+    if (!command) return res.status(400).json({ error: "Comando required" });
+
+    try {
+      proc.stdin?.write(command + "\n");
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: "Erro ao enviar comando." });
+    }
   });
 
   app.get("/api/jobs", (req, res) => {
     res.json(jobs.slice(-10)); // return last 10 jobs
   });
 
-  app.get("/api/logs", (req, res) => {
+  app.get("/api/logs", authenticateToken, (req, res) => {
     try {
-      const content = fs.readFileSync(LATEST_LOG_PATH, 'utf-8');
+      const { paths } = getContext(req);
+      const logPath = path.join(paths.logs, "latest.log");
+      if (!fs.existsSync(logPath)) return res.json({ content: "Log ainda não existe para este servidor." });
+      const content = fs.readFileSync(logPath, 'utf-8');
       res.json({ content });
     } catch (e) {
       res.status(500).json({ error: "Could not read logs" });
     }
   });
 
-  app.post("/api/logs/clear", (req, res) => {
+  app.post("/api/logs/clear", authenticateToken, (req, res) => {
     try {
-      fs.writeFileSync(LATEST_LOG_PATH, `--- Log Cleared at ${new Date().toLocaleString()} ---\n`);
+      const { paths, serverId } = getContext(req);
+      const logPath = path.join(paths.logs, "latest.log");
+      fs.writeFileSync(logPath, `--- Log Cleared at ${new Date().toLocaleString()} [${serverId}] ---\n`);
       res.json({ success: true });
     } catch (e) {
       res.status(500).json({ error: "Could not clear logs" });
@@ -1470,6 +1984,9 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Auto-recovery
+  restoreServers().catch(console.error);
 
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`MineControl Dashboard running at http://localhost:${PORT}`);

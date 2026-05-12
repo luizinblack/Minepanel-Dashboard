@@ -27,7 +27,10 @@ import {
   RotateCcw,
   Search,
   Lock,
-  Layout
+  Layout,
+  History,
+  Trash,
+  Info
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'motion/react';
@@ -143,7 +146,73 @@ export default function App() {
   useEffect(() => { isUploadingRef.current = isUploading; }, [isUploading]);
 
   const [activeUploads, setActiveUploads] = useState<any[]>([]);
-  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace' | 'saas'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace' | 'saas' | 'backups'>('monitor');
+  const [backups, setBackups] = useState<any[]>([]);
+
+  const fetchBackups = async () => {
+    try {
+      const res = await apiFetch('/api/backups');
+      const data = await res.json();
+      if (res.ok) setBackups(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'backups') {
+      fetchBackups();
+    }
+  }, [activeTab]);
+
+  const handleCreateBackup = async () => {
+    try {
+      const res = await apiFetch('/api/backups/create', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        alert("Criação de backup iniciada. Acompanhe na fila de tarefas.");
+      } else {
+        alert("Erro: " + data.error);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleRestoreBackup = async (id: string) => {
+    if (!confirm("AVISO: Restaurar um backup irá apagar o mundo atual! Deseja continuar?")) return;
+    try {
+      const res = await apiFetch('/api/backups/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshotId: id })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        alert("Restauração iniciada. O servidor será parado e os arquivos substituídos.");
+      } else {
+        alert("Erro: " + data.error);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleDeleteBackup = async (id: string) => {
+    if (!confirm("Deseja apagar permanentemente este backup?")) return;
+    try {
+      const res = await apiFetch('/api/backups/delete', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshotId: id })
+      });
+      if (res.ok) {
+        fetchBackups();
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
   const [currentPath, setCurrentPath] = useState<string>(".");
   const currentPathRef = useRef(currentPath);
   useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
@@ -180,9 +249,23 @@ export default function App() {
 
   const folderInputRef = useRef<HTMLInputElement>(null);
 
+  const [currentServerId, setCurrentServerId] = useState("server_01");
+  const currentServerIdRef = useRef(currentServerId);
+  useEffect(() => { currentServerIdRef.current = currentServerId; }, [currentServerId]);
+
+  const apiFetch = async (url: string, options: any = {}) => {
+    const token = localStorage.getItem('minecontrol_token');
+    const headers = {
+      ...options.headers,
+      'x-server-id': currentServerIdRef.current,
+      ...(token && token !== "null" ? { 'Authorization': `Bearer ${token}` } : {})
+    };
+    return fetch(url, { ...options, headers });
+  };
+
   const fetchFiles = async (pathStr: string) => {
     try {
-      const res = await fetch(`/api/files?path=${encodeURIComponent(pathStr)}`);
+      const res = await apiFetch(`/api/files?path=${encodeURIComponent(pathStr)}`);
       const data = await res.json();
       if (res.ok) {
         setFileList(data);
@@ -204,14 +287,11 @@ export default function App() {
     const fetchInitialData = async () => {
       if (isUploadingRef.current) return;
       try {
-        const token = localStorage.getItem('minecontrol_token');
-        const authHeader = (token && token !== "null") ? { 'Authorization': `Bearer ${token}` } : {};
-
         const [statusRes, jobsRes, logsRes, auditRes] = await Promise.all([
-          fetch('/api/status'),
-          fetch('/api/jobs'),
-          fetch('/api/logs'),
-          fetch('/api/admin/logs', { headers: authHeader as any })
+          apiFetch('/api/status'),
+          apiFetch('/api/jobs'),
+          apiFetch('/api/logs'),
+          apiFetch('/api/admin/logs')
         ]);
         
         if (statusRes.ok) {
@@ -244,6 +324,7 @@ export default function App() {
     };
 
     fetchInitialData();
+    socket.emit("join", currentServerIdRef.current);
 
     socket.on('system_metrics', (newMetrics: SystemStats) => {
       setStats(newMetrics);
@@ -266,6 +347,10 @@ export default function App() {
 
     socket.on('console_log', (log: string) => {
       setLogs(prev => [...prev, log].slice(-200));
+    });
+
+    socket.on('console_history', (history: string[]) => {
+      setLogs(history);
     });
 
     socket.on('job_update', (updatedJob: ServerJob) => {
@@ -350,9 +435,10 @@ export default function App() {
 
   const handleStart = async () => {
     try {
-      const res = await fetch('/api/start', {
+      const res = await apiFetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ramMin: '512M', ramMax: '2048M', autoRestart: true })
       });
       if (!res.ok) {
         const err = await res.json();
@@ -365,7 +451,7 @@ export default function App() {
 
   const handleStop = async () => {
     try {
-      await fetch('/api/stop', { method: 'POST' });
+      await apiFetch('/api/stop', { method: 'POST' });
     } catch (err) {
       console.error(err);
     }
@@ -543,7 +629,7 @@ export default function App() {
         fetchFiles(fullPath);
       } else {
         try {
-          const res = await fetch(`/api/file/read?path=${encodeURIComponent(fullPath)}`);
+          const res = await apiFetch(`/api/file/read?path=${encodeURIComponent(fullPath)}`);
           const data = await res.json();
           if (res.ok) {
             setEditingFile({ path: fullPath, content: data.content });
@@ -557,7 +643,7 @@ export default function App() {
       if (!confirm(`Deseja apagar ${file.name}?`)) return;
       const fullPath = currentPath === "." ? file.name : `${currentPath}/${file.name}`;
       try {
-        const res = await fetch('/api/file/delete', {
+        const res = await apiFetch('/api/file/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: fullPath })
@@ -570,7 +656,7 @@ export default function App() {
     save: async () => {
       if (!editingFile) return;
       try {
-        const res = await fetch('/api/file/write', {
+        const res = await apiFetch('/api/file/write', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: editingFile.path, content: editingFile.content })
@@ -583,7 +669,7 @@ export default function App() {
     create: async () => {
       const fullPath = currentPath === "." ? newName : `${currentPath}/${newName}`;
       try {
-        const res = await fetch('/api/file/create', {
+        const res = await apiFetch('/api/file/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: fullPath, isDirectory: isCreating === 'folder' })
@@ -600,7 +686,7 @@ export default function App() {
     extract: async (file: any) => {
       try {
         setIsUploading(true);
-        const res = await fetch('/api/files/extract', {
+        const res = await apiFetch('/api/files/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: file.name, currentPath }),
@@ -626,7 +712,7 @@ export default function App() {
     deleteAll: async () => {
       if (!confirm("AVISO: Isso irá apagar TODOS os arquivos e pastas do servidor! Deseja continuar?")) return;
       try {
-        const res = await fetch('/api/files/all', {
+        const res = await apiFetch('/api/files/all', {
           method: 'DELETE'
         });
         if (res.ok) {
@@ -647,7 +733,7 @@ export default function App() {
     if (!command.trim() || status !== 'running') return;
     
     try {
-      await fetch('/api/command', {
+      await apiFetch('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: command.trim() })
@@ -660,7 +746,7 @@ export default function App() {
 
   const clearLogs = async () => {
     try {
-      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      const res = await apiFetch('/api/logs/clear', { method: 'POST' });
       if (res.ok) {
         setLogs([]);
       }
@@ -891,6 +977,15 @@ export default function App() {
               )}
             >
               <Layout size={12} /> SaaS Portal
+            </button>
+            <button 
+              onClick={() => setActiveTab('backups')}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
+                activeTab === 'backups' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
+              )}
+            >
+              <History size={12} /> Backups
             </button>
           </div>
 
@@ -1178,6 +1273,84 @@ export default function App() {
                       Pressione ENTER para enviar
                     </div>
                   </div>
+              </motion.div>
+            ) : activeTab === 'backups' ? (
+              <motion.div 
+                key="backups"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 1.05 }}
+                className="space-y-8"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <h2 className="text-3xl font-black italic uppercase tracking-tighter text-white">Snapshots & Backups</h2>
+                    <p className="text-slate-500 text-sm">Gerencie o histórico de estados e restaure seu servidor com um clique.</p>
+                  </div>
+                  <button 
+                    onClick={handleCreateBackup}
+                    className="px-6 py-3 bg-[#38e11d] text-black font-black uppercase text-xs tracking-widest rounded-xl hover:scale-105 active:scale-95 transition-all shadow-lg shadow-[#38e11d]/20 flex items-center gap-2"
+                  >
+                    <Plus size={16} /> Criar Snapshot Agora
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {backups.length === 0 ? (
+                    <div className="col-span-full py-20 text-center bg-[#161616] border border-[#2d2d2d] rounded-2xl border-dashed">
+                      <History size={48} className="text-slate-700 mx-auto mb-4" />
+                      <h3 className="text-lg font-bold text-slate-400 uppercase tracking-widest">Nenhum snapshot encontrado</h3>
+                      <p className="text-slate-600 text-xs mt-2 italic">Seus backups aparecerão aqui após a criação.</p>
+                    </div>
+                  ) : backups.map(backup => (
+                    <div key={backup.id} className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-6 group hover:border-[#38e11d] transition-all relative overflow-hidden">
+                      <div className="flex items-center justify-between mb-4">
+                        <div className="w-10 h-10 rounded-lg bg-[#242424] flex items-center justify-center text-[#38e11d]">
+                          <Database size={20} />
+                        </div>
+                        <span className="text-[10px] font-mono text-slate-600 uppercase">{backup.id.split('-').pop()}</span>
+                      </div>
+                      
+                      <div className="space-y-4">
+                        <div>
+                          <h4 className="text-sm font-black text-white uppercase truncate">{backup.filename}</h4>
+                          <p className="text-[10px] text-slate-500 font-mono mt-1">{(backup.size / 1024 / 1024).toFixed(2)} MB • {new Date(backup.created_at).toLocaleString()}</p>
+                        </div>
+
+                        <div className="flex gap-2">
+                          <button 
+                            onClick={() => handleRestoreBackup(backup.id)}
+                            className="flex-1 py-3 bg-white/5 hover:bg-[#38e11d] text-white hover:text-black font-bold text-[10px] uppercase rounded-lg transition-all flex items-center justify-center gap-2"
+                          >
+                            <RotateCcw size={12} /> Restaurar
+                          </button>
+                          <button 
+                            onClick={() => handleDeleteBackup(backup.id)}
+                            className="w-12 py-3 bg-white/5 hover:bg-red-500/20 text-slate-500 hover:text-red-500 rounded-lg transition-all flex items-center justify-center"
+                          >
+                            <Trash size={14} />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Visual accent */}
+                      <div className="absolute top-0 right-0 w-32 h-32 bg-[#38e11d]/5 rounded-full blur-3xl -mr-16 -mt-16 group-hover:bg-[#38e11d]/10 transition-colors" />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-6 flex gap-4 items-start">
+                  <div className="p-3 bg-amber-500/10 rounded-xl">
+                    <Info size={20} className="text-amber-500" />
+                  </div>
+                  <div>
+                    <h5 className="text-xs font-black text-amber-500 uppercase tracking-widest mb-1">Informações de Segurança</h5>
+                    <p className="text-[11px] text-slate-400 leading-relaxed font-medium">
+                      A restauração de um snapshot é irreversível e substituirá todos os arquivos do mundo, plugins e configurações atuais. 
+                      Recomendamos criar um snapshot preventivo antes de qualquer restauração importante. O servidor será desligado automaticamente durante o processo.
+                    </p>
+                  </div>
+                </div>
               </motion.div>
             ) : activeTab === 'saas' ? (
               <motion.div 

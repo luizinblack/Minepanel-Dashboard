@@ -1,6 +1,6 @@
 {
   "name": "MinePanel Local Dashboard",
-  "description": "A local Minecraft server management dashboard with system resource monitoring (CPU, RAM, GPU), console logs, and process controls.",
+  "description": "A high-performance local Minecraft server management dashboard with system resource monitoring, live console, marketplace integration, and professional snapshot/backup system.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
