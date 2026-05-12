@@ -1246,6 +1246,27 @@ async function startServer() {
     }
   });
 
+  app.delete("/api/files/all", (req, res) => {
+    try {
+      if (fs.existsSync(STANDARDIZED_UPLOADS_DIR)) {
+        const items = fs.readdirSync(STANDARDIZED_UPLOADS_DIR);
+        for (const item of items) {
+          const itemPath = path.join(STANDARDIZED_UPLOADS_DIR, item);
+          if (fs.statSync(itemPath).isDirectory()) {
+            fs.rmSync(itemPath, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(itemPath);
+          }
+        }
+      }
+      fs.writeFileSync(UPLOAD_METADATA_PATH, "[]");
+      res.json({ message: "Todos os arquivos foram removidos com sucesso" });
+    } catch (err: any) {
+      console.error(err);
+      res.status(500).json({ error: "Erro ao remover arquivos" });
+    }
+  });
+
   app.post("/api/files/extract", async (req, res) => {
     const { filename, currentPath } = req.body;
     // Previne Directory Traversal

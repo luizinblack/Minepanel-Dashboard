@@ -508,12 +508,14 @@ export default function App() {
       const tasks = [];
       for (let i = 0; i < totalFiles; i++) {
         const file = files[i];
-        tasks.push((async () => {
-           await uploadChunked(file);
-           processedCount++;
-           const p = Math.round((processedCount / totalFiles) * 100);
-           setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: p, count: `${processedCount}/${totalFiles}` } : u));
-        })());
+        tasks.push(globalUploadLimit(async () => {
+          await uploadChunked(file, { sharedLimit: globalUploadLimit });
+          processedCount++;
+          const p = Math.round((processedCount / totalFiles) * 100);
+          setActiveUploads(prev => prev.map(u => u.id === folderUploadId 
+            ? { ...u, progress: p, count: `${processedCount}/${totalFiles}` } 
+            : u));
+        }));
       }
       await Promise.all(tasks);
       setActiveUploads(prev => prev.map(u => u.id === folderUploadId ? { ...u, progress: 100, status: 'done' } : u));
@@ -615,6 +617,23 @@ export default function App() {
       parts.pop();
       const parent = parts.join('/') || ".";
       fetchFiles(parent);
+    },
+    deleteAll: async () => {
+      if (!confirm("AVISO: Isso irá apagar TODOS os arquivos e pastas do servidor! Deseja continuar?")) return;
+      try {
+        const res = await fetch('/api/files/all', {
+          method: 'DELETE'
+        });
+        if (res.ok) {
+          fetchFiles(currentPath);
+        } else {
+          const data = await res.json();
+          alert(data.error || "Erro ao apagar arquivos");
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Erro na conexão com o servidor");
+      }
     }
   };
 
@@ -1607,6 +1626,12 @@ export default function App() {
                         className="flex items-center gap-2 px-3 py-1.5 bg-[#00d1ff]/10 text-[#00d1ff] border border-[#00d1ff]/20 rounded-lg text-[10px] font-black uppercase hover:bg-[#00d1ff]/20 transition-all"
                       >
                         <Plus size={12} /> pasta
+                      </button>
+                      <button 
+                        onClick={handleFileAction.deleteAll}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 text-red-500 border border-red-500/20 rounded-lg text-[10px] font-black uppercase hover:bg-red-500/20 transition-all"
+                      >
+                        <Trash2 size={12} /> apagar tudo
                       </button>
                    </div>
                 </div>
