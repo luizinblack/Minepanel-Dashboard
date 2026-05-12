@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { 
-  Server as ServerIcon, 
+  Server as ServerIcon,
   Cpu, 
   Database, 
   Terminal, 
@@ -9,9 +9,7 @@ import {
   Square, 
   Upload, 
   Activity,
-  HardDrive,
   Settings,
-  ChevronRight,
   Folder,
   File as FileIcon,
   Trash2,
@@ -23,11 +21,8 @@ import {
   Archive,
   X,
   Download,
-  ScrollText,
   RotateCcw,
   Search,
-  Lock,
-  Layout,
   History,
   Trash,
   Info
@@ -52,84 +47,29 @@ const socket = io();
 // Limite global compartilhado entre TODOS os arquivos
 const globalUploadLimit = pLimit(1);
 
+// Cache System
+const MEMORY_CACHE = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 5000; // 5 seconds
+
+// --- TYPES & INTERFACES ---
 interface SystemStats {
-  cpu: {
-    usage: number;
-    cores: number;
-    temp: number;
-  };
-  ram: {
-    total: number;
-    used: number;
-    free: number;
-    percent: number;
-  };
-  gpu: {
-    name: string;
-    usage: number;
-    temp: number;
-    memoryUsed: number;
-    memoryTotal: number;
-  } | null;
-  network: {
-    tx: number;
-    rx: number;
-  };
+  cpu: { usage: number; cores: number; temp: number };
+  ram: { total: number; used: number; free: number; percent: number };
+  network: { tx: number; rx: number };
   throughput: number;
   uptime: number;
   timestamp: string;
-  saas?: {
-    activeTenants: number;
-    totalUploads: number;
-  };
 }
 
-interface SaaSData {
-  tenant: {
-    id: string;
-    name: string;
-    email: string;
-    planId: string;
-    apiKey: string;
-  };
-  plan: {
-    id: string;
-    name: string;
-    storageLimit: number;
-    bandwidthLimit: number;
-    maxConcurrentUploads: number;
-  };
-  usage: {
-    storageUsed: number;
-    bandwidthUsed: number;
-    uploadsCount: number;
-  };
-}
-
-type JobStatus =
-  | "UPLOADING"
-  | "UPLOADED"
-  | "VALIDATING"
-  | "QUEUED"
-  | "DOWNLOADING"
-  | "INSTALLING"
-  | "EXTRACTING"
-  | "DETECTING"
-  | "CONFIGURING"
-  | "STARTING"
-  | "DONE"
-  | "FAILED";
+type JobStatus = "UPLOADING" | "UPLOADED" | "VALIDATING" | "QUEUED" | "DOWNLOADING" | "INSTALLING" | "EXTRACTING" | "DETECTING" | "CONFIGURING" | "STARTING" | "DONE" | "FAILED";
 
 interface ServerJob {
   id: string;
   filename: string;
-  filePath: string;
-  outputPath: string;
   status: JobStatus;
-  hash?: string;
-  createdAt: number;
-  error?: string;
   progress?: number;
+  error?: string;
+  metadata?: any;
 }
 
 export default function App() {
@@ -137,23 +77,64 @@ export default function App() {
   const [statsHistory, setStatsHistory] = useState<any[]>([]);
   const [jobs, setJobs] = useState<ServerJob[]>([]);
   const [status, setStatus] = useState<'stopped' | 'starting' | 'running' | 'stopping'>('stopped');
-  const [hasScript, setHasScript] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [currentJar, setCurrentJar] = useState<string>("");
-  const [availableJars, setAvailableJars] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const isUploadingRef = useRef(isUploading);
   useEffect(() => { isUploadingRef.current = isUploading; }, [isUploading]);
 
   const [activeUploads, setActiveUploads] = useState<any[]>([]);
-  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'marketplace' | 'saas' | 'backups'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'files' | 'console' | 'backups'>('monitor');
   const [backups, setBackups] = useState<any[]>([]);
+
+  const [currentPath, setCurrentPath] = useState<string>(".");
+  const currentPathRef = useRef(currentPath);
+  useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
+
+  const [fileList, setFileList] = useState<any[]>([]);
+  const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
+  const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
+  const [newName, setNewName] = useState("");
+  const [command, setCommand] = useState("");
+  
+  const consoleEndRef = useRef<HTMLDivElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  const [currentServerId] = useState("server_01");
+  const currentServerIdRef = useRef(currentServerId);
+
+  // --- API FETCH WITH CACHE ---
+  const apiFetch = async (url: string, options: any = {}, useCache = false) => {
+    const cacheKey = url + JSON.stringify(options);
+    
+    if (useCache && MEMORY_CACHE.has(cacheKey)) {
+      const cached = MEMORY_CACHE.get(cacheKey)!;
+      if (Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.data;
+      }
+    }
+
+    const token = localStorage.getItem('minecontrol_token');
+    const headers = {
+      ...options.headers,
+      'x-server-id': currentServerIdRef.current,
+      ...(token && token !== "null" ? { 'Authorization': `Bearer ${token}` } : {})
+    };
+    
+    const response = await fetch(url, { ...options, headers });
+    const data = await response.json();
+    
+    if (useCache && response.ok) {
+      MEMORY_CACHE.set(cacheKey, { data, timestamp: Date.now() });
+    }
+    
+    return { ok: response.ok, status: response.status, data };
+  };
 
   const fetchBackups = async () => {
     try {
-      const res = await apiFetch('/api/backups');
-      const data = await res.json();
-      if (res.ok) setBackups(data);
+      const { ok, data } = await apiFetch('/api/backups', {}, true);
+      if (ok) setBackups(data);
     } catch (err) {
       console.error(err);
     }
@@ -167,9 +148,8 @@ export default function App() {
 
   const handleCreateBackup = async () => {
     try {
-      const res = await apiFetch('/api/backups/create', { method: 'POST' });
-      const data = await res.json();
-      if (res.ok) {
+      const { ok, data } = await apiFetch('/api/backups/create', { method: 'POST' });
+      if (ok) {
         alert("Criação de backup iniciada. Acompanhe na fila de tarefas.");
       } else {
         alert("Erro: " + data.error);
@@ -182,13 +162,12 @@ export default function App() {
   const handleRestoreBackup = async (id: string) => {
     if (!confirm("AVISO: Restaurar um backup irá apagar o mundo atual! Deseja continuar?")) return;
     try {
-      const res = await apiFetch('/api/backups/restore', {
+      const { ok, data } = await apiFetch('/api/backups/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ snapshotId: id })
       });
-      const data = await res.json();
-      if (res.ok) {
+      if (ok) {
         alert("Restauração iniciada. O servidor será parado e os arquivos substituídos.");
       } else {
         alert("Erro: " + data.error);
@@ -201,73 +180,23 @@ export default function App() {
   const handleDeleteBackup = async (id: string) => {
     if (!confirm("Deseja apagar permanentemente este backup?")) return;
     try {
-      const res = await apiFetch('/api/backups/delete', {
+      const { ok } = await apiFetch('/api/backups/delete', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ snapshotId: id })
       });
-      if (res.ok) {
+      if (ok) {
         fetchBackups();
       }
     } catch (err) {
       console.error(err);
     }
   };
-  const [currentPath, setCurrentPath] = useState<string>(".");
-  const currentPathRef = useRef(currentPath);
-  useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
-
-  const [fileList, setFileList] = useState<any[]>([]);
-  const [editingFile, setEditingFile] = useState<{ path: string, content: string } | null>(null);
-  const [isCreating, setIsCreating] = useState<'file' | 'folder' | null>(null);
-  const [newName, setNewName] = useState("");
-  const [command, setCommand] = useState("");
-  const [auditLogs, setAuditLogs] = useState<any[]>([]);
-  const [saasData, setSaaSData] = useState<SaaSData | null>(null);
-  const [isLogged, setIsLogged] = useState(false);
-  const [showLogin, setShowLogin] = useState(false);
-  const [loginEmail, setLoginEmail] = useState("luizfelipebarbosa122@gmail.com");
-  
-  // Marketplace States
-  const [marketQuery, setMarketQuery] = useState("");
-  const [marketProjects, setMarketProjects] = useState<any[]>([]);
-  const [isSearchingMarket, setIsSearchingMarket] = useState(false);
-  const [selectedProject, setSelectedProject] = useState<any>(null);
-  const [projectVersions, setProjectVersions] = useState<any[]>([]);
-  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
-  
-  const [marketPage, setMarketPage] = useState(1);
-  const [hasMoreMarket, setHasMoreMarket] = useState(true);
-  const [marketFilterLoader, setMarketFilterLoader] = useState("");
-  const [marketFilterVersion, setMarketFilterVersion] = useState("");
-  const [syncStatus, setSyncStatus] = useState<{ isSyncing: boolean, lastSync: number }>({ isSyncing: false, lastSync: 0 });
-
-  const marketObserver = useRef<IntersectionObserver | null>(null);
-  const marketLastElementRef = useRef<HTMLDivElement | null>(null);
-
-  const consoleEndRef = useRef<HTMLDivElement>(null);
-
-  const folderInputRef = useRef<HTMLInputElement>(null);
-
-  const [currentServerId, setCurrentServerId] = useState("server_01");
-  const currentServerIdRef = useRef(currentServerId);
-  useEffect(() => { currentServerIdRef.current = currentServerId; }, [currentServerId]);
-
-  const apiFetch = async (url: string, options: any = {}) => {
-    const token = localStorage.getItem('minecontrol_token');
-    const headers = {
-      ...options.headers,
-      'x-server-id': currentServerIdRef.current,
-      ...(token && token !== "null" ? { 'Authorization': `Bearer ${token}` } : {})
-    };
-    return fetch(url, { ...options, headers });
-  };
 
   const fetchFiles = async (pathStr: string) => {
     try {
-      const res = await apiFetch(`/api/files?path=${encodeURIComponent(pathStr)}`);
-      const data = await res.json();
-      if (res.ok) {
+      const { ok, data } = await apiFetch(`/api/files?path=${encodeURIComponent(pathStr)}`, {}, true);
+      if (ok) {
         setFileList(data);
         setCurrentPath(pathStr);
       }
@@ -283,40 +212,27 @@ export default function App() {
   }, [activeTab, currentPath]);
 
   useEffect(() => {
-    // Initial status fetch + jobs + audit logs (Centralized)
+    // Initial status fetch + jobs
     const fetchInitialData = async () => {
       if (isUploadingRef.current) return;
       try {
-        const [statusRes, jobsRes, logsRes, auditRes] = await Promise.all([
-          apiFetch('/api/status'),
-          apiFetch('/api/jobs'),
-          apiFetch('/api/logs'),
-          apiFetch('/api/admin/logs')
+        const [statusRes, jobsRes, logsRes] = await Promise.all([
+          apiFetch('/api/status', {}, true),
+          apiFetch('/api/jobs', {}, true),
+          apiFetch('/api/logs', {}, true)
         ]);
         
         if (statusRes.ok) {
-          const statusData = await statusRes.json();
-          setStatus(statusData.status);
-          setCurrentJar(statusData.jar);
-          setAvailableJars(statusData.availableJars);
-          setHasScript(statusData.hasScript);
+          setStatus(statusRes.data.status);
+          setCurrentJar(statusRes.data.jar);
         }
         
         if (jobsRes.ok) {
-          const jobsData = await jobsRes.json();
-          if (Array.isArray(jobsData)) setJobs(jobsData);
+          if (Array.isArray(jobsRes.data)) setJobs(jobsRes.data);
         }
 
-        if (logsRes.ok) {
-          const logsData = await logsRes.json();
-          if (logsData.content) {
-            setLogs(logsData.content.split('\n').filter((l: string) => l.length > 0));
-          }
-        }
-
-        if (auditRes.ok) {
-          const auditData = await auditRes.json();
-          setAuditLogs(Array.isArray(auditData) ? auditData : []);
+        if (logsRes.ok && logsRes.data.content) {
+          setLogs(logsRes.data.content.split('\n').filter((l: string) => l.length > 0));
         }
       } catch (e) {
         console.warn("Initial data fetch failed");
@@ -385,64 +301,19 @@ export default function App() {
     };
   }, []);
 
-  // SaaS Data Polling - Paused during upload
-  useEffect(() => {
-    if (activeTab === 'saas' && localStorage.getItem('minecontrol_token') && !isUploading) {
-      const fetchSaaS = async () => {
-        try {
-          const res = await fetch('/api/saas/me', {
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('minecontrol_token')}` }
-          });
-          if (res.ok) {
-            const data = await res.json();
-            setSaaSData(data);
-            setIsLogged(true);
-          }
-        } catch (e) {
-          console.error("Erro ao buscar dados SaaS", e);
-        }
-      };
-
-      fetchSaaS();
-      const interval = setInterval(fetchSaaS, 30000); // Optimized for high load
-      return () => clearInterval(interval);
-    }
-  }, [activeTab, isUploading]);
-
-  // Marketplace Sync Polling - Paused during upload
-  useEffect(() => {
-    let interval: any;
-    if (activeTab === 'marketplace' && !isUploading) {
-      const checkSync = async () => {
-        try {
-          const res = await fetch('/api/marketplace/sync/status');
-          if (res.ok) {
-            const data = await res.json();
-            setSyncStatus(data);
-          }
-        } catch (e) {}
-      };
-
-      checkSync();
-      interval = setInterval(checkSync, 10000);
-    }
-    return () => clearInterval(interval);
-  }, [activeTab, isUploading]);
-
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   const handleStart = async () => {
     try {
-      const res = await apiFetch('/api/start', {
+      const { ok, data } = await apiFetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ramMin: '512M', ramMax: '2048M', autoRestart: true })
       });
-      if (!res.ok) {
-        const err = await res.json();
-        alert(err.error);
+      if (!ok) {
+        alert(data.error);
       }
     } catch (err) {
       console.error(err);
@@ -570,7 +441,6 @@ export default function App() {
       setTimeout(() => {
         setActiveUploads(prev => prev.filter(u => u.id !== newUpload.id));
       }, 5000);
-      fetch('/api/admin/uploads').then(res => res.json()).then(setAuditLogs);
     } catch (err: any) {
       console.error(err);
       setActiveUploads(prev => prev.map(u => u.id === newUpload.id ? { ...u, status: 'error', error: err.message } : u));
@@ -629,9 +499,8 @@ export default function App() {
         fetchFiles(fullPath);
       } else {
         try {
-          const res = await apiFetch(`/api/file/read?path=${encodeURIComponent(fullPath)}`);
-          const data = await res.json();
-          if (res.ok) {
+          const { ok, data } = await apiFetch(`/api/file/read?path=${encodeURIComponent(fullPath)}`, {}, true);
+          if (ok) {
             setEditingFile({ path: fullPath, content: data.content });
           }
         } catch (err) {
@@ -643,12 +512,12 @@ export default function App() {
       if (!confirm(`Deseja apagar ${file.name}?`)) return;
       const fullPath = currentPath === "." ? file.name : `${currentPath}/${file.name}`;
       try {
-        const res = await apiFetch('/api/file/delete', {
+        const { ok } = await apiFetch('/api/file/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: fullPath })
         });
-        if (res.ok) fetchFiles(currentPath);
+        if (ok) fetchFiles(currentPath);
       } catch (err) {
         console.error(err);
       }
@@ -656,12 +525,12 @@ export default function App() {
     save: async () => {
       if (!editingFile) return;
       try {
-        const res = await apiFetch('/api/file/write', {
+        const { ok } = await apiFetch('/api/file/write', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: editingFile.path, content: editingFile.content })
         });
-        if (res.ok) setEditingFile(null);
+        if (ok) setEditingFile(null);
       } catch (err) {
         console.error(err);
       }
@@ -669,12 +538,12 @@ export default function App() {
     create: async () => {
       const fullPath = currentPath === "." ? newName : `${currentPath}/${newName}`;
       try {
-        const res = await apiFetch('/api/file/create', {
+        const { ok } = await apiFetch('/api/file/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: fullPath, isDirectory: isCreating === 'folder' })
         });
-        if (res.ok) {
+        if (ok) {
           setIsCreating(null);
           setNewName("");
           fetchFiles(currentPath);
@@ -686,13 +555,12 @@ export default function App() {
     extract: async (file: any) => {
       try {
         setIsUploading(true);
-        const res = await apiFetch('/api/files/extract', {
+        const { ok, data } = await apiFetch('/api/files/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: file.name, currentPath }),
         });
-        const data = await res.json();
-        if (!res.ok) {
+        if (!ok) {
           alert("Erro ao adicionar na fila: " + data.error);
         }
       } catch (err) {
@@ -712,13 +580,12 @@ export default function App() {
     deleteAll: async () => {
       if (!confirm("AVISO: Isso irá apagar TODOS os arquivos e pastas do servidor! Deseja continuar?")) return;
       try {
-        const res = await apiFetch('/api/files/all', {
+        const { ok, data } = await apiFetch('/api/files/all', {
           method: 'DELETE'
         });
-        if (res.ok) {
+        if (ok) {
           fetchFiles(currentPath);
         } else {
-          const data = await res.json();
           alert(data.error || "Erro ao apagar arquivos");
         }
       } catch (err) {
@@ -746,125 +613,14 @@ export default function App() {
 
   const clearLogs = async () => {
     try {
-      const res = await apiFetch('/api/logs/clear', { method: 'POST' });
-      if (res.ok) {
+      const { ok } = await apiFetch('/api/logs/clear', { method: 'POST' });
+      if (ok) {
         setLogs([]);
       }
     } catch (e) {
       console.error(e);
     }
   };
-
-  const marketplaceActions = {
-    search: async (e?: React.FormEvent, reset: boolean = true) => {
-      e?.preventDefault();
-      
-      const newPage = reset ? 1 : marketPage + 1;
-      if (reset) {
-        setIsSearchingMarket(true);
-        setMarketProjects([]);
-        setMarketPage(1);
-      }
-      
-      try {
-        const params = new URLSearchParams({
-          q: marketQuery,
-          page: newPage.toString(),
-          limit: "20",
-          loader: marketFilterLoader,
-          version: marketFilterVersion
-        });
-        
-        const res = await fetch(`/api/marketplace/search?${params.toString()}`);
-        const data = await res.json();
-        
-        if (reset) {
-          setMarketProjects(data.projects || []);
-        } else {
-          setMarketProjects(prev => [...prev, ...(data.projects || [])]);
-        }
-        
-        setHasMoreMarket(data.hasMore);
-        setMarketPage(newPage);
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setIsSearchingMarket(false);
-      }
-    },
-    triggerSync: async () => {
-      await fetch('/api/marketplace/sync/start', { method: 'POST' });
-      alert("Sincronização forçada iniciada!");
-    },
-    selectProject: async (project: any) => {
-      setSelectedProject(project);
-      setIsLoadingVersions(true);
-      try {
-        const res = await fetch(`/api/marketplace/versions?id=${project.id}&provider=${project.provider}`);
-        const data = await res.json();
-        setProjectVersions(data.versions || []);
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setIsLoadingVersions(false);
-      }
-    },
-    install: async (version: any) => {
-      if (!selectedProject) return;
-      
-      if (!confirm(`Deseja instalar o modpack "${selectedProject.title}" na versão "${version.name}"? Isso pode sobrescrever arquivos existentes.`)) return;
-
-      try {
-        const res = await fetch('/api/marketplace/install', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: selectedProject.id,
-            versionId: version.id,
-            provider: selectedProject.provider,
-            title: selectedProject.title,
-            downloadUrl: selectedProject.provider === 'modrinth' 
-              ? version.files.find((f: any) => f.primary)?.url || version.files[0].url 
-              : version.download_url
-          })
-        });
-        const data = await res.json();
-        if (res.ok) {
-          alert("Instalação iniciada! Acompanhe o progresso na barra lateral de jobs.");
-          setSelectedProject(null);
-        } else {
-          alert("Erro: " + data.error);
-        }
-      } catch (err) {
-        console.error(err);
-        alert("Erro ao conectar com o servidor.");
-      }
-    }
-  };
-
-  // Infinite Scroll Observer
-  useEffect(() => {
-    if (activeTab !== 'marketplace' || isSearchingMarket || !hasMoreMarket) return;
-
-    if (marketObserver.current) marketObserver.current.disconnect();
-
-    marketObserver.current = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting) {
-        marketplaceActions.search(undefined, false);
-      }
-    });
-
-    if (marketLastElementRef.current) marketObserver.current.observe(marketLastElementRef.current);
-    
-    return () => marketObserver.current?.disconnect();
-  }, [marketProjects, activeTab, isSearchingMarket, hasMoreMarket]);
-
-  // Initial marketplace load
-  useEffect(() => {
-    if (activeTab === 'marketplace' && marketProjects.length === 0) {
-      marketplaceActions.search();
-    }
-  }, [activeTab]);
 
   const downloadLogs = () => {
     const element = document.createElement("a");
@@ -961,24 +717,6 @@ export default function App() {
               Console do Servidor
             </button>
             <button 
-              onClick={() => setActiveTab('marketplace')}
-              className={cn(
-                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
-                activeTab === 'marketplace' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
-              )}
-            >
-              <Archive size={12} /> Marketplace
-            </button>
-            <button 
-              onClick={() => setActiveTab('saas')}
-              className={cn(
-                "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
-                activeTab === 'saas' ? "bg-[#38e11d] text-black" : "text-slate-500 hover:text-white"
-              )}
-            >
-              <Layout size={12} /> SaaS Portal
-            </button>
-            <button 
               onClick={() => setActiveTab('backups')}
               className={cn(
                 "px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
@@ -1025,10 +763,10 @@ export default function App() {
                     percentage={Math.min(((stats?.network.tx || 0) + (stats?.network.rx || 0)) / 10000000 * 100, 100)}
                   />
                   <MetricCard 
-                    label="Throughput SaaS" 
+                    label="Disk I/O" 
                     value={`${((stats?.throughput || 0) / 1024 / 1024).toFixed(2)} MB/s`} 
                     icon={<RotateCcw className="text-amber-500" size={16} />}
-                    subLabel="Taxa de Upload Ativa"
+                    subLabel="Taxa de I/O de Arquivos"
                     color="#f59e0b"
                     percentage={Math.min((stats?.throughput || 0) / 50000000 * 100, 100)}
                   />
@@ -1149,45 +887,6 @@ export default function App() {
                         />
                       </form>
                    </div>
-                </div>
-
-                {/* Audit Logs Section */}
-                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden shadow-xl">
-                  <div className="bg-[#1a1a1a] px-6 py-4 border-b border-[#2d2d2d] flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                       <div className="w-1 h-3 bg-amber-500 rounded-full" />
-                       <h3 className="text-xs font-black uppercase tracking-[0.2em] text-white">Auditoria de Eventos</h3>
-                    </div>
-                    <button 
-                      onClick={() => fetch('/api/admin/logs').then(res => res.json()).then(data => Array.isArray(data) ? setAuditLogs(data) : setAuditLogs([]))}
-                      className="text-[10px] font-bold text-slate-500 hover:text-white uppercase transition-colors"
-                    >
-                      Atualizar
-                    </button>
-                  </div>
-                  <div className="p-4 max-h-[300px] overflow-y-auto custom-scrollbar space-y-2">
-                    {auditLogs.length === 0 ? (
-                      <div className="text-center py-8 text-slate-600 text-xs italic">Nenhum evento registrado recentemente.</div>
-                    ) : (
-                      auditLogs.map((log, idx) => (
-                        <div key={idx} className="flex gap-4 p-3 bg-black/20 rounded-xl border border-white/5 hover:border-white/10 transition-colors">
-                          <div className={cn(
-                            "w-1 self-stretch rounded-full shrink-0",
-                            log.level === 'error' ? "bg-red-500" : log.level === 'warn' ? "bg-amber-500" : "bg-[#38e11d]"
-                          )} />
-                          <div className="flex-1 space-y-1">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-black uppercase text-white tracking-widest">{log.message}</span>
-                              <span className="text-[8px] font-mono text-slate-500">{new Date(log.timestamp).toLocaleString()}</span>
-                            </div>
-                            {log.details && (
-                              <p className="text-[9px] text-slate-400 font-mono line-clamp-1">{JSON.stringify(log.details)}</p>
-                            )}
-                          </div>
-                        </div>
-                      )).reverse()
-                    )}
-                  </div>
                 </div>
               </motion.div>
             ) : activeTab === 'console' ? (
@@ -1351,424 +1050,6 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-              </motion.div>
-            ) : activeTab === 'saas' ? (
-              <motion.div 
-                key="saas"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 1.05 }}
-                className="space-y-8"
-              >
-                {!isLogged ? (
-                   <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-12 text-center space-y-6">
-                      <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto">
-                        <Lock size={32} className="text-amber-500" />
-                      </div>
-                      <div className="space-y-2">
-                        <h2 className="text-2xl font-black italic uppercase tracking-tighter text-white">Portal do Tenant</h2>
-                        <p className="text-slate-500 max-w-md mx-auto">Acesso restrito ao painel administrativo do seu SaaS. Autentique-se para gerenciar planos e limites.</p>
-                      </div>
-                      <button 
-                        onClick={() => {
-                          fetch('/api/saas/auth/login', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ email: loginEmail })
-                          }).then(r => r.json()).then(data => {
-                             if (data.token) {
-                               localStorage.setItem('minecontrol_token', data.token);
-                               setIsLogged(true);
-                               window.location.reload();
-                             }
-                          });
-                        }}
-                        className="px-8 py-4 bg-[#38e11d] text-black font-black uppercase tracking-widest rounded-xl hover:scale-105 transition-transform"
-                      >
-                        Entrar com login seguro
-                      </button>
-                   </div>
-                ) : (
-                  <>
-                    {/* SaaS Overview Header */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                       <div className="bg-[#161616] p-8 border border-[#2d2d2d] rounded-2xl space-y-4">
-                          <span className="text-[10px] font-black uppercase text-slate-500 tracking-widest">Plano Ativo</span>
-                          <h3 className="text-3xl font-black italic text-[#38e11d] uppercase tracking-tighter">{saasData?.plan.name}</h3>
-                          <p className="text-xs text-slate-400">Próxima renovação: 11 de Junho, 2026</p>
-                       </div>
-                       <div className="md:col-span-2 bg-[#161616] p-8 border border-[#2d2d2d] rounded-2xl grid grid-cols-1 md:grid-cols-2 gap-8">
-                          <div className="space-y-3">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Armazenamento</span>
-                              <span className="text-xs font-mono text-white">
-                                {( (saasData?.usage.storageUsed || 0) / 1024 / 1024 / 1024 ).toFixed(2)} / {saasData?.plan.storageLimit} GB
-                              </span>
-                            </div>
-                            <div className="h-2 bg-white/5 rounded-full overflow-hidden">
-                               <motion.div 
-                                 initial={{ width: 0 }}
-                                 animate={{ width: `${Math.min(((saasData?.usage.storageUsed || 0) / (saasData?.plan.storageLimit || 1) / 1024 / 1024 / 1024) * 100, 100)}%` }}
-                                 className="h-full bg-[#00d1ff] shadow-[0_0_15px_rgba(0,209,255,0.4)]"
-                               />
-                            </div>
-                          </div>
-                          <div className="space-y-3">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Bandwidth (Saída)</span>
-                              <span className="text-xs font-mono text-white">
-                                {( (saasData?.usage.bandwidthUsed || 0) / 1024 / 1024 / 1024 ).toFixed(2)} / {saasData?.plan.bandwidthLimit} GB
-                              </span>
-                            </div>
-                            <div className="h-2 bg-white/5 rounded-full overflow-hidden">
-                               <motion.div 
-                                 initial={{ width: 0 }}
-                                 animate={{ width: `${Math.min(((saasData?.usage.bandwidthUsed || 0) / (saasData?.plan.bandwidthLimit || 1) / 1024 / 1024 / 1024) * 100, 100)}%` }}
-                                 className="h-full bg-[#bd00ff] shadow-[0_0_15px_rgba(189,0,255,0.4)]"
-                               />
-                            </div>
-                          </div>
-                       </div>
-                    </div>
-
-                    {/* Enterprise Management Section */}
-                    <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl overflow-hidden">
-                       <div className="px-6 py-4 border-b border-[#2d2d2d] bg-[#1a1a1a] flex items-center justify-between">
-                          <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-white">Configurações do Tenant</h4>
-                          <span className="text-[8px] font-mono text-slate-500">ID: {saasData?.tenant.id}</span>
-                       </div>
-                       <div className="p-8 space-y-8">
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
-                             <div className="space-y-4">
-                                <label className="text-[10px] font-bold uppercase text-slate-500 tracking-widest">API Key primária</label>
-                                <div className="flex gap-2">
-                                   <input 
-                                     type="password" 
-                                     value={saasData?.tenant.apiKey} 
-                                     readOnly 
-                                     className="flex-1 bg-black/40 border border-white/5 rounded-lg px-4 py-3 text-xs font-mono text-[#38e11d]" 
-                                   />
-                                   <button className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-bold uppercase text-white transition-colors">Copiar</button>
-                                </div>
-                                <p className="text-[9px] text-slate-500 italic">Use esta chave para integrar o sistema de upload via API externa.</p>
-                             </div>
-                             <div className="space-y-4">
-                                <label className="text-[10px] font-bold uppercase text-slate-500 tracking-widest">Regras de Concorrência</label>
-                                <div className="p-4 bg-white/5 rounded-xl border border-white/5">
-                                   <div className="flex items-center justify-between text-xs text-white font-black mb-2 italic uppercase">
-                                      <span>Uploads Simultâneos</span>
-                                      <span className="text-[#38e11d]">{saasData?.plan.maxConcurrentUploads}</span>
-                                   </div>
-                                   <p className="text-[10px] text-slate-500">Seu plano atual permite até {saasData?.plan.maxConcurrentUploads} uploads paralelos. Exceder este limite resultará em enfileiramento automático (SaaS Queue Control).</p>
-                                </div>
-                             </div>
-                          </div>
-                       </div>
-                    </div>
-                  </>
-                )}
-              </motion.div>
-            ) : activeTab === 'marketplace' ? (
-              <motion.div 
-                key="marketplace"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 20 }}
-                className="flex flex-col gap-6 h-[calc(100vh-140px)] pt-2"
-              >
-                {/* Fixed Search Area */}
-                <div className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-8 shadow-xl relative overflow-hidden shrink-0">
-                  {/* Sync Indicator */}
-                  <div className="absolute top-4 right-4 flex items-center gap-2">
-                    {syncStatus.isSyncing && (
-                      <div className="flex items-center gap-2 px-3 py-1 bg-[#38e11d]/10 border border-[#38e11d]/20 rounded-full animate-pulse">
-                        <RotateCcw size={10} className="text-[#38e11d] animate-spin" />
-                        <span className="text-[8px] font-black uppercase text-[#38e11d] tracking-widest">Sincronizando Database...</span>
-                      </div>
-                    )}
-                    {!syncStatus.isSyncing && syncStatus.lastSync > 0 && (
-                      <span className="text-[8px] font-bold text-slate-600 uppercase tracking-widest">
-                        Última Sinc: {new Date(syncStatus.lastSync).toLocaleTimeString()}
-                      </span>
-                    )}
-                    <button 
-                      onClick={marketplaceActions.triggerSync}
-                      className="p-1.5 hover:bg-white/5 rounded-lg text-slate-600 hover:text-white transition-colors"
-                      title="Sincronizar Manualmente"
-                    >
-                      <RotateCcw size={12} />
-                    </button>
-                  </div>
-
-                  <div className="max-w-4xl mx-auto text-center space-y-4">
-                    <h2 className="text-3xl font-black text-white italic uppercase tracking-tighter">Marketplace de Modpacks</h2>
-                    
-                    <form onSubmit={(e) => marketplaceActions.search(e, true)} className="relative mt-4 group">
-                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-[#38e11d] transition-colors" size={20} />
-                      <input 
-                        type="text" 
-                        value={marketQuery}
-                        onChange={(e) => setMarketQuery(e.target.value)}
-                        placeholder="Procure por 'Better Minecraft', 'All the Mods'..."
-                        className="w-full bg-black/40 border border-[#2d2d2d] rounded-xl pl-12 pr-32 py-4 text-white outline-none focus:border-[#38e11d]/50 transition-all font-medium"
-                      />
-                      <button 
-                        type="submit"
-                        disabled={isSearchingMarket}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 bg-[#38e11d] text-black px-6 py-2 rounded-lg font-black text-xs uppercase hover:bg-[#4cf531] disabled:opacity-50 transition-all"
-                      >
-                        {isSearchingMarket ? 'Buscando...' : 'Pesquisar'}
-                      </button>
-                    </form>
-                  </div>
-                </div>
-
-                <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-6">
-                  {/* Horizontal Categories Bar - Sticky at the top of scrollable area */}
-                  <div className="sticky top-0 z-20 pb-4 pt-1 bg-[#0c0c0c]/90 backdrop-blur-md space-y-3">
-                    <div className="flex gap-3 overflow-x-auto pb-1 no-scrollbar scroll-smooth">
-                      {['Tudo', 'RPG', 'Adventure', 'Tech', 'Magic', 'Hardcore', 'Skyblock', 'Quest', 'Vanilla+', 'Cobblemon', 'Horror', 'Expert', 'Multiplayer'].map(cat => (
-                        <button 
-                          key={cat}
-                          onClick={() => {
-                            setMarketQuery(cat === 'Tudo' ? "" : cat.toLowerCase());
-                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
-                          }}
-                          className={cn(
-                            "grow shrink-0 px-6 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all border",
-                            (marketQuery === cat.toLowerCase() || (cat === 'Tudo' && marketQuery === "")) 
-                              ? "bg-[#38e11d] text-black border-[#38e11d] shadow-[0_0_15px_rgba(56,225,29,0.3)]" 
-                              : "bg-[#161616] text-slate-400 border-[#2d2d2d] hover:border-[#38e11d]/50 hover:text-white"
-                          )}
-                        >
-                          {cat}
-                        </button>
-                      ))}
-                    </div>
-
-                    <div className="flex items-center gap-3 overflow-x-auto no-scrollbar">
-                      <div className="flex items-center gap-2 bg-[#161616] border border-[#2d2d2d] rounded-xl px-3 py-1.5 shrink-0">
-                        <span className="text-[8px] font-black uppercase text-slate-500">Versão:</span>
-                        <select 
-                          value={marketFilterVersion}
-                          onChange={(e) => {
-                            setMarketFilterVersion(e.target.value);
-                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
-                          }}
-                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
-                        >
-                          <option value="" className="bg-[#161616]">Todas</option>
-                          <option value="1.21.1" className="bg-[#161616]">1.21.1</option>
-                          <option value="1.20.1" className="bg-[#161616]">1.20.1</option>
-                          <option value="1.19.2" className="bg-[#161616]">1.19.2</option>
-                          <option value="1.18.2" className="bg-[#161616]">1.18.2</option>
-                          <option value="1.16.5" className="bg-[#161616]">1.16.5</option>
-                          <option value="1.12.2" className="bg-[#161616]">1.12.2</option>
-                        </select>
-                      </div>
-
-                      <div className="flex items-center gap-2 bg-[#161616] border border-[#2d2d2d] rounded-xl px-3 py-1.5 shrink-0">
-                        <span className="text-[8px] font-black uppercase text-slate-500">Loader:</span>
-                        <select 
-                          value={marketFilterLoader}
-                          onChange={(e) => {
-                            setMarketFilterLoader(e.target.value);
-                            setTimeout(() => marketplaceActions.search(undefined, true), 0);
-                          }}
-                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
-                        >
-                          <option value="" className="bg-[#161616]">Todos</option>
-                          <option value="forge" className="bg-[#161616]">Forge</option>
-                          <option value="fabric" className="bg-[#161616]">Fabric</option>
-                        </select>
-                      </div>
-
-                      <button 
-                        onClick={() => {
-                          setMarketFilterVersion("");
-                          setMarketFilterLoader("");
-                          setMarketQuery("");
-                          setTimeout(() => marketplaceActions.search(undefined, true), 0);
-                        }}
-                        className="shrink-0 text-[10px] font-black uppercase text-slate-600 hover:text-white transition-colors"
-                      >
-                        Resetar Tudo
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500">
-                      {marketQuery ? `Resultados para "${marketQuery}"` : "Explorar Todos"}
-                    </h3>
-                  </div>
-
-                  {/* Results Grid */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-20">
-                  {marketProjects.map((project, idx) => {
-                    const isLast = idx === marketProjects.length - 1;
-                    return (
-                      <motion.div 
-                        key={`${project.provider}-${project.id}-${idx}`}
-                        ref={isLast ? marketLastElementRef : null}
-                        layoutId={`${project.provider}-${project.id}`}
-                        className="bg-[#161616] border border-[#2d2d2d] rounded-2xl p-5 hover:border-[#38e11d]/30 transition-all flex flex-col gap-4 cursor-pointer group"
-                        onClick={() => marketplaceActions.selectProject(project)}
-                      >
-                        <div className="flex gap-4">
-                          <div className="w-16 h-16 bg-black/40 rounded-xl overflow-hidden shrink-0 border border-white/5 group-hover:border-[#38e11d]/20 transition-all">
-                            {project.icon_url ? (
-                              <img src={project.icon_url} alt={project.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center">
-                                <Archive size={20} className="text-slate-700" />
-                              </div>
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1">
-                              <span className={cn(
-                                "text-[8px] font-black uppercase px-2 py-0.5 rounded border",
-                                project.provider === 'modrinth' ? "text-green-400 border-green-400/20 bg-green-400/5" : "text-orange-400 border-orange-400/20 bg-orange-400/5"
-                              )}>
-                                {project.provider}
-                              </span>
-                              <h4 className="font-black text-white truncate text-sm group-hover:text-[#38e11d] transition-colors tracking-tight">{project.title}</h4>
-                            </div>
-                            <p className="text-xs text-slate-500 line-clamp-2 leading-relaxed h-10">{project.description}</p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center justify-between pt-4 border-t border-white/5">
-                          <div className="flex items-center gap-3 text-[10px] font-bold text-slate-600 uppercase tracking-widest">
-                            <span className="flex items-center gap-1"><Download size={12} /> {project.downloads.toLocaleString()}</span>
-                          </div>
-                          <div className="flex gap-1 overflow-hidden max-w-[80px]">
-                            {project.loaders?.slice(0, 2).map((l: string) => (
-                              <span key={l} className="text-[7px] bg-white/5 text-slate-400 px-1.5 py-0.5 rounded-full border border-white/5 uppercase font-black">{l}</span>
-                            ))}
-                          </div>
-                        </div>
-                      </motion.div>
-                    );
-                  })}
-                </div>
-
-                {isSearchingMarket && (
-                  <div className="py-20 text-center space-y-4">
-                    <RotateCcw className="mx-auto text-[#38e11d] animate-spin" size={32} />
-                    <p className="text-slate-500 text-xs font-bold uppercase tracking-widest animate-pulse">Explorando modpacks...</p>
-                  </div>
-                )}
-
-                {marketProjects.length === 0 && !isSearchingMarket && (
-                  <div className="py-20 text-center space-y-3 bg-[#161616] border border-[#2d2d2d] rounded-3xl">
-                    <Archive size={40} className="mx-auto text-slate-800" />
-                    <p className="text-slate-600 italic">Nenhum modpack encontrado em cache ou na busca.</p>
-                    <button onClick={marketplaceActions.triggerSync} className="text-[#38e11d] text-xs font-bold uppercase border border-[#38e11d]/20 px-4 py-2 rounded-xl mt-4">Sincronizar Agora</button>
-                  </div>
-                )}
-
-                {hasMoreMarket && !isSearchingMarket && marketProjects.length > 0 && (
-                   <div className="py-8 flex justify-center">
-                      <div className="w-8 h-8 rounded-full border-2 border-[#38e11d]/20 border-t-[#38e11d] animate-spin" />
-                   </div>
-                )}
-
-                </div>
-
-                {/* Project Details Modal */}
-                <AnimatePresence>
-                  {selectedProject && (
-                    <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-8">
-                       <motion.div 
-                         initial={{ scale: 0.95, opacity: 0, y: 20 }}
-                         animate={{ scale: 1, opacity: 1, y: 0 }}
-                         exit={{ scale: 0.95, opacity: 0, y: 20 }}
-                         className="bg-[#161616] border border-[#2d2d2d] rounded-3xl w-full max-w-6xl h-[90vh] flex flex-col shadow-2xl overflow-hidden"
-                       >
-                         {/* Modal Header */}
-                         <div className="p-8 border-b border-[#2d2d2d] bg-[#1a1a1a] flex gap-8">
-                            <div className="w-24 h-24 bg-black/40 rounded-2xl overflow-hidden shrink-0 shadow-xl border border-white/5">
-                               {selectedProject.icon_url ? (
-                                 <img src={selectedProject.icon_url} alt={selectedProject.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                               ) : (
-                                 <div className="w-full h-full flex items-center justify-center"><Archive size={32} className="text-slate-700" /></div>
-                               )}
-                            </div>
-                            <div className="flex-1 space-y-2">
-                               <div className="flex items-center gap-3">
-                                 <span className={cn(
-                                   "text-[10px] font-black uppercase px-2 py-0.5 rounded border",
-                                   selectedProject.provider === 'modrinth' ? "text-green-400 border-green-400/20 bg-green-400/5" : "text-orange-400 border-orange-400/20 bg-orange-400/5"
-                                 )}>
-                                   {selectedProject.provider}
-                                 </span>
-                                 <h2 className="text-2xl font-black text-white uppercase italic tracking-tighter">{selectedProject.title}</h2>
-                               </div>
-                               <p className="text-slate-400 text-sm leading-relaxed">{selectedProject.description}</p>
-                            </div>
-                            <button 
-                              onClick={() => setSelectedProject(null)}
-                              className="self-start p-2 hover:bg-white/5 rounded-full text-slate-500 hover:text-white transition-all"
-                            >
-                              <X size={24} />
-                            </button>
-                         </div>
-
-                         {/* Version List */}
-                         <div className="flex-1 overflow-y-auto custom-scrollbar p-8">
-                            <div className="flex items-center justify-between mb-6">
-                               <h3 className="text-xs font-black uppercase tracking-[0.2em] text-[#38e11d]">Selecione a Versão</h3>
-                               <div className="text-[10px] font-bold text-slate-500 uppercase">Ordenado por data</div>
-                            </div>
-
-                            {isLoadingVersions ? (
-                              <div className="py-20 text-center space-y-4">
-                                <RotateCcw className="mx-auto text-[#38e11d] animate-spin" size={32} />
-                                <p className="text-slate-500 text-xs font-bold uppercase tracking-widest animate-pulse">Carregando versões disponíveis...</p>
-                              </div>
-                            ) : (
-                              <div className="space-y-3">
-                                {projectVersions.map((version) => (
-                                  <div 
-                                    key={version.id}
-                                    className="bg-black/30 border border-[#2d2d2d] rounded-2xl p-5 flex items-center justify-between group hover:border-[#38e11d]/40 transition-all border-l-4 border-l-transparent hover:border-l-[#38e11d]"
-                                  >
-                                    <div className="space-y-1">
-                                      <div className="flex items-center gap-3">
-                                        <h5 className="font-bold text-white mb-0.5">{version.name}</h5>
-                                        <div className="flex gap-1">
-                                          {version.game_versions?.slice(0, 3).map((gv: string) => (
-                                            <span key={gv} className="text-[8px] bg-white/5 text-slate-400 px-1.5 py-0.5 rounded uppercase font-bold">{gv}</span>
-                                          ))}
-                                        </div>
-                                      </div>
-                                      <div className="flex items-center gap-4 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
-                                        <span className="text-indigo-400">Minecraft {version.game_versions?.[0]}</span>
-                                        {version.loaders?.length > 0 && (
-                                          <span className="flex items-center gap-1.5">
-                                            <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                                            {version.loaders.join(', ')}
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                    <button 
-                                      onClick={() => marketplaceActions.install(version)}
-                                      className="flex items-center gap-3 px-6 py-2.5 bg-[#38e11d] text-black rounded-xl font-black text-xs uppercase hover:bg-[#4cf531] transition-all shadow-lg active:scale-95 group-hover:shadow-[#38e11d]/20"
-                                    >
-                                      <Plus size={14} /> Instalar
-                                    </button>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                         </div>
-                       </motion.div>
-                    </div>
-                  )}
-                </AnimatePresence>
               </motion.div>
             ) : (
               <motion.div 
